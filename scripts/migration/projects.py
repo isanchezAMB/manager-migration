@@ -174,7 +174,7 @@ def migrate_projects_AT(mysql_url):
 # started_at
 # target_date
 # ended_at
-def migrate_projects_obres(mysql_url):
+def migrate_projects_obra(mysql_url):
     mysql_engine = create_engine(mysql_url)
     
     print("Starting Works Projects migration (No Duplicates)...")
