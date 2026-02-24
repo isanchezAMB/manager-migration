@@ -284,3 +284,100 @@ def update_types(json_file, mysql_url, oracle_config):
             
     except Exception as e:
         print(f"Error updating MySQL: {e}")
+
+
+
+# migrar action_city:
+# La informació prové de la taula PIO_ACTUACIONS
+# action_id = cercar a la taula actions el id que tingui el mateix tracking_code que el CASEID de PIO_ACTUACIONS
+# city_id = cercar a la taula cities el id que tingui el mateix key que el camp ETIQUETAMUNICIPIS de PIO_ACTUACIONS
+# el camp ETIQUETAMUNICIPIS s'ha de normalitzar a minúscules i eliminar qualsevol caràcter com apòstrof, i els espais convertirlos en guions, per exemple "Sant Cugat del Vallès" -> "sant-cugat-del-valles", així s'assegura que coincideixi amb el camp key de la taula cities que ja està net.
+
+def migrate_action_city(mysql_url, oracle_config):
+    print("Starting Action <-> City migration...")
+    
+    mysql_engine = create_engine(mysql_url)
+
+    # LOAD MYSQL CONTEXT
+    print("Loading MySQL maps (Actions and Cities)...")
+    try:
+        actions_df = pd.read_sql("SELECT id, tracking_code FROM actions", mysql_engine)
+        actions_df['clean_code'] = (
+            pd.to_numeric(actions_df['tracking_code'], errors='coerce')
+            .fillna(0).astype(int).astype(str)
+        )
+        action_map = dict(zip(actions_df['clean_code'], actions_df['id']))
+
+        cities_df = pd.read_sql("SELECT id, `key` FROM cities", mysql_engine)
+        cities_df['key_clean'] = cities_df['key'].astype(str).str.strip().str.lower()
+        city_map = dict(zip(cities_df['key_clean'], cities_df['id']))
+
+    except Exception as e:
+        print(f"Error loading MySQL dependencies: {e}")
+        return
+
+    # READ ORACLE DATA
+    print("Reading PIO_ACTUACIONS from Oracle...")
+    try:
+        with oracledb.connect(**oracle_config) as ora_conn:
+            query = "SELECT CASEID, ETIQUETAMUNICIPIS FROM PIO_ACTUACIONS WHERE ETIQUETAMUNICIPIS IS NOT NULL"
+            df_act = pd.read_sql(query, ora_conn)
+            print(f"Read {len(df_act)} base relations from Oracle.")
+    except Exception as e:
+        print(f"Fatal error connecting to Oracle: {e}")
+        return
+
+    if df_act.empty: 
+        return
+
+    # SEPARATE MULTIPLE MUNICIPALITIES AND NORMALIZE
+    print("Normalizing and mapping municipalities...")
+
+    df_act['case_clean'] = pd.to_numeric(df_act['CASEID'], errors='coerce').fillna(0).astype(int).astype(str)
+
+    # Separate by commas and explode into independent rows
+    df_act['MUNICIPI_LLISTA'] = df_act['ETIQUETAMUNICIPIS'].astype(str).str.split(r',\s*')
+    df_act = df_act.explode('MUNICIPI_LLISTA')
+
+    # Normalize municipality strings
+    df_act['mun_norm'] = df_act['MUNICIPI_LLISTA'].astype(str).str.lower().str.strip()
+    
+    df_act['mun_norm'] = (
+        df_act['mun_norm']
+        .str.normalize('NFKD')
+        .str.encode('ascii', errors='ignore')
+        .str.decode('utf-8')
+    )
+    
+    df_act['mun_norm'] = df_act['mun_norm'].str.replace("'", "", regex=False)
+    df_act['mun_norm'] = df_act['mun_norm'].str.replace(r'\s+', '-', regex=True)
+    df_act['mun_norm'] = df_act['mun_norm'].replace({
+        'hospitalet-de-llobregat': 'lhospitalet-de-llobregat',
+    })
+
+    # Map to MySQL IDs
+    df_act['action_id'] = df_act['case_clean'].map(action_map)
+    df_act['city_id'] = df_act['mun_norm'].map(city_map)
+
+    # Filter out missing records and drop duplicates
+    df_final = df_act.dropna(subset=['action_id', 'city_id']).copy()
+    df_final = df_final.drop_duplicates(subset=['action_id', 'city_id'])
+    
+    total_final = len(df_final)
+
+    if df_final.empty: 
+        print("No valid relations found to insert.")
+        return
+
+    # PREPARE AND INSERT
+    df_final['created_at'] = datetime.now()
+    df_final['updated_at'] = datetime.now()
+
+    cols_to_insert = ['action_id', 'city_id', 'created_at', 'updated_at']
+
+    print("Inserting into 'action_city' (MySQL)...")
+    try:
+        df_final[cols_to_insert].to_sql('action_city', con=mysql_engine, if_exists='append', index=False)
+        print(f"Success! {total_final} relations inserted correctly.")
+    except Exception as e:
+        print(f"Error inserting into MySQL: {e}")
