@@ -35,3 +35,52 @@ def json_cases_planificacions():
         
     print(f"Done, json saved in '{nombre_archivo}'.")
     print(f"Number of cases: {len(lista_casos)}")
+
+
+def clean_database(mysql_url):
+    
+    # Safety check
+    confirm = input("Are you sure you want to clean the database? Type 'Y' to confirm: ")
+    if confirm != "Y":
+        print("Aborting database cleaning.")
+        return
+
+    engine = create_engine(mysql_url)
+
+    # List of tables to clean
+    tables_to_clean = [
+        "economic_item_anual_budgets", 
+        "economic_items",              
+        "certifications",              
+        "projects",                    
+        "actions",                     
+        "services",                     
+        "action_city",
+        "programs",
+        "action_program"
+    ]
+
+    try:
+        with engine.connect() as conn:
+            # Deactivate foreign key checks
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 0;"))
+
+            # Clean each table
+            for table in tables_to_clean:
+                print(f"   Cleaning: {table}...")
+                try:
+                    conn.execute(text(f"TRUNCATE TABLE {table};"))
+                except Exception as e:
+                    print(f"      Error truncating table {table}: {e}")
+
+            # Reactivate foreign key checks
+            print("   Reactivating foreign key checks...")
+            conn.execute(text("SET FOREIGN_KEY_CHECKS = 1;"))
+            
+            # Commit changes
+            conn.commit()
+            
+        print("Database cleaned successfully.")
+
+    except Exception as e:
+        print(f"Fatal error during cleaning: {e}")

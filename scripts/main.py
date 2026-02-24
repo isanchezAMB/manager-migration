@@ -1,9 +1,10 @@
 from helpers.config import ORACLE_CONFIG, MYSQL_URL, VALID_CASES
 from migration.actions import migrate_actions, update_types
-from helpers.init import json_cases_planificacions
+from helpers.init import json_cases_planificacions, clean_database
 
 
 if __name__ == "__main__":
+    clean_database(MYSQL_URL)
     json_cases_planificacions()
 
 
