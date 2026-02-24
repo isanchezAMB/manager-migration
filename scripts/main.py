@@ -6,6 +6,7 @@ from migration.programs import migrate_programs
 from migration.fundings import migrate_fundings
 from migration.projects import migrate_projects_AT, migrate_projects_obra
 from migration.certifications import migrate_certifications_AT, migrate_certifications_obra
+from migration.economic import migrate_economic_items_AT, migrate_economic_items_obra, migrate_economic_items_anual_budgets_AT, migrate_economic_items_anual_budgets_obra
 
 
 if __name__ == "__main__":
@@ -21,8 +22,15 @@ if __name__ == "__main__":
     migrate_programs(MYSQL_URL, ORACLE_CONFIG)
     migrate_fundings(MYSQL_URL, ORACLE_CONFIG)
 
+
     migrate_projects_AT(MYSQL_URL)
     migrate_projects_obra(MYSQL_URL)
 
     migrate_certifications_AT(MYSQL_URL, ORACLE_CONFIG, "data/map_assistance_type.json")
     migrate_certifications_obra(MYSQL_URL, ORACLE_CONFIG)
+
+    migrate_economic_items_AT(MYSQL_URL)
+    migrate_economic_items_obra(MYSQL_URL)
+    
+    migrate_economic_items_anual_budgets_AT(MYSQL_URL)
+    migrate_economic_items_anual_budgets_obra(MYSQL_URL, ORACLE_CONFIG)
