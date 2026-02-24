@@ -3,6 +3,7 @@ from migration.actions import migrate_actions, update_types, migrate_action_city
 from helpers.init import json_cases_planificacions, clean_database
 from migration.services import migrate_services
 from migration.programs import migrate_programs
+from migration.fundings import migrate_fundings
 
 
 if __name__ == "__main__":
@@ -16,3 +17,4 @@ if __name__ == "__main__":
     migrate_action_city(MYSQL_URL, ORACLE_CONFIG)
 
     migrate_programs(MYSQL_URL, ORACLE_CONFIG)
+    migrate_fundings(MYSQL_URL, ORACLE_CONFIG)
