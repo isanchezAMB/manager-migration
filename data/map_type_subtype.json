@@ -1,0 +1,95 @@
+{
+    "equipament": {
+        "tipus":[
+            "Instal·lacions",
+            "Edificació",
+            "Edificació - Rehabilitació",
+            "Seu AMB"
+        ],
+        "subtipus": {
+        "obra-nova": [
+            "Obres",
+            "Docent",
+            "Sanitari - Assistencial",
+            "Cultural",
+            "Esportiu",
+            "Mercat",
+            "Administratiu",
+            "Seguretat"
+        ],
+        "rehabilitacio": [
+            "Integral",
+            "Reforma",
+            "Premis",
+            "Publicacions",
+            "Estudis"
+        ],
+        "espais-exteriors-vinculats-a-edificacio": [],
+        "rehabilitacio-patrimonial": [],
+        "enderrocs": [
+            "Enderroc"
+        ],
+        "intervencio-estructural": [
+            "Estructural",
+            "Reparació estructural"
+        ],
+        "intervencio-facana": [
+            "Façanes"
+        ],
+        "intervencio-coberta": [],
+        "intervencio-coberta-i-facana": [],
+        "rehabilitacio-energetica": [],
+        "adequacio-interior": [
+            "Exposicions"
+        ],
+        "mobiliari": [
+            "Mobiliari i equipament"
+        ],
+        "reparacions-o-millores-inst-clima-o-acs": [
+            "Instal·lacions"
+        ],
+        "millores-de-sostenibilitat": [],
+        "fotovoltaica": [
+            "Fotovoltàica"
+        ]
+        }
+    },
+    "espai-public": {
+        "tipus":[
+            "Obra civil"
+        ],
+        "subtipus": {
+            "nova-urbanitzacio": [
+                "Parc",
+                "Parc Metropolità"
+            ],
+            "reurbanitzacio-amb-serveis-afectats-i-sanejament": [],
+            "reurbanitzacio-amb-serveis-afectats": [
+                "Platges",
+                "Rius i riera"
+            ],
+            "reurbanitzacio-amb-serveis-municipals-i-sanejament": [],
+            "reurbanitzacio-amb-serveis-municipals": [
+                "Carrer",
+                "Plaça",
+                "Carril bicicleta",
+                "Instal·lacions i serveis",
+                "Serveis",
+                "Espai Públic"
+            ],
+            "amb-equipaments-o-jocs": [],
+            "sense-equipaments-o-jocs": [],
+            "amb-murs-i-estructures": [],
+            "nova-construccio": [],
+            "jardineria": [],
+            "enllumenat": [],
+            "soterrament-de-linies": [],
+            "collector": [],
+            "ampliacio": [],
+            "tactic": [
+                "Mobilitat sostenible"
+            ]
+        }
+    }
+}
+
