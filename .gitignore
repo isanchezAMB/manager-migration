@@ -1,0 +1,4 @@
+scripts/helpers/config.py
+data/casos_planificacions.json
+scripts/helpers/__pycache__/
+scripts/migration/__pycache__/
