@@ -169,3 +169,118 @@ def migrate_actions(mysql_url, oracle_config, valid_cases):
         print(f"Migration successful: {len(df)} actions inserted.")
     except Exception as e:
         print(f"MySQL Loading Error: {e}")
+
+
+
+# Migrar TipusActuacio:
+# Afegir id de tipus_actuacio i subtipus_actuacio a la taula actions
+# Tenim un json que relacion el tipus i subtipus antic amb el nou
+# A la taula PIO_ACTUACIONS tenim el camp SUBTIPUSACTUACIO que es un integer que fa referència a la taula PIO_SUBTIPUSACTUACIO
+# A la taula PIO_SUBTIPUSACTUACIO tenim el camp IDTIPUSDACTUACIO que fa referència a la taula PIO_TIPUSDACTUACIO
+# A la taula PIO_TIPUSACTUACIO tenim el camp TIPUS_ACTUACIO que es el nom del tipus d'actuacio
+# A la taula PIO_SUBTIPUSACTUACIO tenim el camp SUBTIPUS_ACTUACIO que es el nom del subtipus d'actuacio
+# El json relaciona el nom del tipus i subtipus nou amb el nom del tipus i subtipus antic, per tant haurem de fer un mapping a través d'aquests noms
+def update_types(json_file, mysql_url, oracle_config):
+    mysql_engine = create_engine(mysql_url)
+    
+    with open(json_file, "r", encoding="utf-8") as f:
+        MAPPING_JSON = json.load(f)
+
+    # Plain mapping dictionaries
+    old_to_new_type = {}
+    old_to_new_subtype = {}
+
+    for type_key, content in MAPPING_JSON.items():
+        # Type
+        for old_name in content.get("tipus", []):
+            old_to_new_type[old_name] = type_key
+        # Subtype
+        for subtype_key, old_list in content.get("subtipus", {}).items():
+            for old_name in old_list:
+                old_to_new_subtype[old_name] = subtype_key
+
+    # Obtain UUID mapping for action types from MySQL
+    try:
+        at_df = pd.read_sql("SELECT id, `key` FROM action_types", mysql_engine)
+        
+        key_to_uuid = dict(zip(at_df['key'], at_df['id']))
+    except Exception as e:
+        print(f"Error reading action_types from MySQL: {e}")
+        return
+
+    df = pd.DataFrame()
+    try:
+        with oracledb.connect(user=oracle_config["user"], 
+                             password=oracle_config["password"], 
+                             dsn=oracle_config["dsn"]) as ora_conn:
+            
+            query = """
+                SELECT 
+                    a.CASEID, 
+                    t.TIPUSACTUACIO AS OLD_TYPE,
+                    s.SUBTIPUSACTUACIO AS OLD_SUBTYPE
+                FROM PIO_ACTUACIONS a
+                LEFT JOIN PIO_PROJECTE p ON a.PROJECTE = p.IDPROJECTE
+                LEFT JOIN PIO_SUBTIPUSDACTUACIO s ON p.SUBTIPUSACTUACIO = s.IDSUBTIPUSDACTUACIO
+                LEFT JOIN PIO_TIPUSDACTUACIO t ON s.IDTIPUSDACTUACIO = t.IDTIPUSDACTUACIO
+            """
+            df = pd.read_sql(query, ora_conn)
+            
+        print(f"{len(df)} rows extracted from Oracle for type mapping.")
+    except Exception as e:
+        print(f"Error extracting from Oracle: {e}")
+        return
+
+  
+    if not df.empty:
+        df['tracking_code'] = pd.to_numeric(df['CASEID'], errors='coerce').fillna(0).astype(int).astype(str)
+        
+        # Map OLD_TYPE to new type keys, then to UUIDs
+        df['type_uuid'] = df['OLD_TYPE'].map(old_to_new_type).map(key_to_uuid)
+        
+        # Map OLD_SUBTYPE to new subtype keys, then to UUIDs
+        df['subtype_uuid'] = df['OLD_SUBTYPE'].map(old_to_new_subtype).map(key_to_uuid)
+
+        # Filter only rows where tracking_code is not null (valid cases)
+        update_df = df[['tracking_code', 'type_uuid', 'subtype_uuid']].dropna(subset=['tracking_code'])
+        
+        print(f"Row ready to update: {len(update_df)}")
+        print(f"   - Types found: {update_df['type_uuid'].notnull().sum()}")
+        print(f"   - Subtypes found: {update_df['subtype_uuid'].notnull().sum()}")
+        
+    else:
+        print("No data found in Oracle for type mapping.")
+        return
+
+
+    try:
+        with mysql_engine.begin() as conn:
+            # Temporary table
+            conn.execute(text("""
+                CREATE TEMPORARY TABLE temp_update_types (
+                    tracking_code VARCHAR(255),
+                    type_uuid CHAR(36),
+                    subtype_uuid CHAR(36),
+                    INDEX(tracking_code)
+                );
+            """))
+            
+            # Load data into temporary table
+            update_df.to_sql('temp_update_types', con=conn, if_exists='append', index=False)
+            
+            # Update actions using JOIN with temporary table
+            result = conn.execute(text("""
+                UPDATE actions a
+                INNER JOIN temp_update_types t ON a.tracking_code = t.tracking_code
+                SET 
+                    a.action_type_id = t.type_uuid,
+                    a.action_subtype_id = t.subtype_uuid;
+            """))
+            
+            # Drop temporary table
+            conn.execute(text("DROP TEMPORARY TABLE IF EXISTS temp_update_types;"))
+            
+            print(f"Done, rows updated: {result.rowcount}")
+            
+    except Exception as e:
+        print(f"Error updating MySQL: {e}")
