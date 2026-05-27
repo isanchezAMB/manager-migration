@@ -1,522 +1,436 @@
-from sqlalchemy import create_engine
-from helpers.pg_connection import get_pg_connection
-import pandas as pd
-from datetime import datetime
+import csv
 import uuid
 import numpy as np
+from datetime import datetime
+from sqlalchemy import create_engine, text
+from helpers.pg_connection import get_pg_connection
 
-# migrar economic_items:
-# AT
-# prové de les dades de la nostra base de dades, de la taula dadeseconomiques_at
-# name = tipologia_assistencia 
-# code = codi_tipologia # !!!!!!hi ha uns quants que no tenen codi_tipologia perque son dos AT8 per un premi o coses semblants.
-# desciption = tipologia_assistencia
-# type = "technical-assistance"
-# amount = import_total
-# action_id = referència a la taula actions, la taula antiga té cas que fa referència al tracking_code de la taula actions, per tant haurem de fer un mapping amb el camp cas de dadeseconomiques_at com a tracking_code per trobar el uuid de l'acció
-# project_id = DE MOMENT NO RELACIONEM, ELLS NO HO FAN (cercar mateix action_id i mateix codi_tipologia a la taula projects, per trobar el projecte que té aquesta assistència tècnica (a la taula projects, el camp code és el codi_tipologia i el camp action_id és el mateix que l'acció de l'economic_item))
+
+# ---------------------------------------------------------------------------
+# MySQL maps
+# ---------------------------------------------------------------------------
+
+def _load_action_map(engine):
+    with engine.connect() as conn:
+        return {
+            str(int(float(r[0]))): r[1]
+            for r in conn.execute(text(
+                "SELECT tracking_code, id FROM actions WHERE tracking_code IS NOT NULL"
+            ))
+        }
+
+
+def _load_existing_items(engine):
+    with engine.connect() as conn:
+        return {
+            (r[0], str(r[1]).strip()): r[2]
+            for r in conn.execute(text(
+                "SELECT action_id, code, id FROM economic_items WHERE action_id IS NOT NULL AND code IS NOT NULL"
+            ))
+        }
+
+
+def _load_existing_budgets(engine):
+    with engine.connect() as conn:
+        return {
+            (r[0], int(r[1]))
+            for r in conn.execute(text(
+                "SELECT economic_item_id, year FROM economic_item_anual_budgets"
+            ))
+        }
+
+
+# ---------------------------------------------------------------------------
+# economic_items — AT
+# ---------------------------------------------------------------------------
+
+def _extract_at_items_pg(action_map):
+    try:
+        conn = get_pg_connection()
+        import pandas as pd
+        df = pd.read_sql(
+            "SELECT cas, tipologia_assistencia, codi_tipologia, import_total FROM dadeseconomiques_at",
+            conn
+        )
+        conn.close()
+        return _build_at_records(df, action_map, col_cas="cas", col_name="tipologia_assistencia",
+                                  col_code="codi_tipologia", col_amount="import_total")
+    except Exception as e:
+        print(f"  PG error: {e}")
+        return []
+
+
+def _extract_at_items_csv(action_map):
+    import pandas as pd
+    df = pd.read_csv("data/pg_export/dadeseconomiques_at.csv", encoding="utf-8-sig", dtype=str)
+    return _build_at_records(df, action_map, col_cas="cas", col_name="tipologia_assistencia",
+                              col_code="codi_tipologia", col_amount="import_total")
+
+
+def _build_at_records(df, action_map, col_cas, col_name, col_code, col_amount):
+    records = []
+    for _, row in df.iterrows():
+        cas = str(row[col_cas]).split(".")[0].strip()
+        action_id = action_map.get(cas)
+        if not action_id:
+            continue
+        code = str(row.get(col_code) or "").strip() or None
+        name = str(row.get(col_name) or "Assistència Tècnica").strip()[:191]
+        try:
+            amount = float(row.get(col_amount) or 0)
+        except (ValueError, TypeError):
+            amount = 0.0
+        records.append({
+            "id": str(uuid.uuid4()),
+            "action_id": action_id,
+            "code": code,
+            "name": name,
+            "description": name,
+            "type": "technical-assistance",
+            "amount": round(amount, 2),
+            "project_id": None,
+        })
+    return records
+
+
+def _insert_items(engine, records, existing):
+    now = datetime.now()
+    inserted = skipped = 0
+    with engine.connect() as conn:
+        for r in records:
+            key = (r["action_id"], str(r["code"] or "").strip())
+            if key in existing:
+                skipped += 1
+                continue
+            existing[key] = r["id"]
+            conn.execute(text("""
+                INSERT INTO economic_items
+                    (id, name, description, action_id, project_id, code, type, amount, created_at, updated_at)
+                VALUES
+                    (:id, :name, :description, :action_id, :project_id, :code, :type, :amount, :created_at, :updated_at)
+            """), {**r, "created_at": now, "updated_at": now})
+            inserted += 1
+        conn.commit()
+    return inserted, skipped
+
+
+# ---------------------------------------------------------------------------
+# economic_items — Obra
+# ---------------------------------------------------------------------------
+
+def _extract_obra_items_pg(action_map):
+    try:
+        conn = get_pg_connection()
+        import pandas as pd
+        df = pd.read_sql("SELECT cas, pec_iva FROM dadeseconomiques_obra", conn)
+        conn.close()
+        return _build_obra_records(df, action_map, col_cas="cas", col_amount="pec_iva")
+    except Exception as e:
+        print(f"  PG error: {e}")
+        return []
+
+
+def _extract_obra_items_csv(action_map):
+    import pandas as pd
+    df = pd.read_csv("data/pg_export/dadeseconomiques_obra.csv", encoding="utf-8-sig", dtype=str)
+    return _build_obra_records(df, action_map, col_cas="cas", col_amount="pec_iva")
+
+
+def _build_obra_records(df, action_map, col_cas, col_amount):
+    seen = set()
+    records = []
+    for _, row in df.iterrows():
+        cas = str(row[col_cas]).split(".")[0].strip()
+        action_id = action_map.get(cas)
+        if not action_id or action_id in seen:
+            continue
+        seen.add(action_id)
+        try:
+            amount = float(row.get(col_amount) or 0)
+        except (ValueError, TypeError):
+            amount = 0.0
+        records.append({
+            "id": str(uuid.uuid4()),
+            "action_id": action_id,
+            "code": "Obra",
+            "name": "Obra",
+            "description": "Obra",
+            "type": "work",
+            "amount": round(amount, 2),
+            "project_id": None,
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# economic_item_anual_budgets — AT
+# ---------------------------------------------------------------------------
+
+def _extract_at_budgets_pg(item_lookup):
+    try:
+        conn = get_pg_connection()
+        import pandas as pd
+        df = pd.read_sql(
+            "SELECT id_at, anualitat, import_anualitat FROM dadeseconomiques_at_financament_anualitats",
+            conn
+        )
+        conn.close()
+        return _build_at_budget_records(df, item_lookup)
+    except Exception as e:
+        print(f"  PG error: {e}")
+        return []
+
+
+def _extract_at_budgets_csv(item_lookup):
+    import pandas as pd
+    df = pd.read_csv(
+        "data/pg_export/dadeseconomiques_at_financament_anualitats.csv",
+        encoding="utf-8-sig", dtype=str
+    )
+    return _build_at_budget_records(df, item_lookup)
+
+
+def _build_at_budget_records(df, item_lookup):
+    records = []
+    for _, row in df.iterrows():
+        id_at = str(row.get("id_at") or "").strip()
+        # id_at format: XXXX_ATY  → tracking_code=XXXX, at_code=ATY
+        if "_" not in id_at:
+            continue
+        parts = id_at.split("_", 1)
+        tracking_code = parts[0].strip()
+        at_code = parts[1].strip()
+
+        item_id = item_lookup.get((tracking_code, at_code))
+        if not item_id:
+            continue
+
+        try:
+            year = int(float(str(row.get("anualitat") or 0)))
+            amount = float(str(row.get("import_anualitat") or 0))
+        except (ValueError, TypeError):
+            continue
+
+        records.append({
+            "id": str(uuid.uuid4()),
+            "economic_item_id": item_id,
+            "year": year,
+            "amount": round(amount, 2),
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# economic_item_anual_budgets — Obra
+# ---------------------------------------------------------------------------
+
+def _extract_obra_budgets_pg(obra_item_lookup):
+    try:
+        conn = get_pg_connection()
+        import pandas as pd
+        df = pd.read_sql(
+            "SELECT cas, anualitat, import_anualitat FROM dadeseconomiques_obra_financament",
+            conn
+        )
+        conn.close()
+        return _build_obra_budget_records(df, obra_item_lookup)
+    except Exception as e:
+        print(f"  PG error: {e}")
+        return []
+
+
+def _extract_obra_budgets_csv(obra_item_lookup):
+    import pandas as pd
+    df = pd.read_csv(
+        "data/pg_export/dadeseconomiques_obra_financament.csv",
+        encoding="utf-8-sig", dtype=str
+    )
+    return _build_obra_budget_records(df, obra_item_lookup)
+
+
+def _build_obra_budget_records(df, obra_item_lookup):
+    records = []
+    for _, row in df.iterrows():
+        cas = str(row.get("cas") or "").split(".")[0].strip()
+        item_id = obra_item_lookup.get(cas)
+        if not item_id:
+            continue
+        try:
+            year = int(float(str(row.get("anualitat") or 0)))
+            amount = float(str(row.get("import_anualitat") or 0))
+        except (ValueError, TypeError):
+            continue
+        records.append({
+            "id": str(uuid.uuid4()),
+            "economic_item_id": item_id,
+            "year": year,
+            "amount": round(amount, 2),
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Insert budgets (shared)
+# ---------------------------------------------------------------------------
+
+def _insert_budgets(engine, records, existing):
+    now = datetime.now()
+    inserted = skipped = 0
+    with engine.connect() as conn:
+        for r in records:
+            key = (r["economic_item_id"], r["year"])
+            if key in existing:
+                skipped += 1
+                continue
+            existing.add(key)
+            conn.execute(text("""
+                INSERT INTO economic_item_anual_budgets
+                    (id, economic_item_id, amount, year, created_at, updated_at)
+                VALUES
+                    (:id, :economic_item_id, :amount, :year, :created_at, :updated_at)
+            """), {**r, "created_at": now, "updated_at": now})
+            inserted += 1
+        conn.commit()
+    return inserted, skipped
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_budgets(records, items_with_amounts, label):
+    from collections import defaultdict
+    sums = defaultdict(float)
+    for r in records:
+        sums[r["economic_item_id"]] += r["amount"]
+
+    alerts = []
+    for item_id, total in items_with_amounts.items():
+        annual_sum = sums.get(item_id, 0.0)
+        if not np.isclose(annual_sum, total, atol=0.05):
+            alerts.append((item_id, annual_sum, total, annual_sum - total))
+
+    if alerts:
+        alerts.sort(key=lambda x: abs(x[3]), reverse=True)
+        print(f"  [{label}] {len(alerts)} items where annual sum != total:")
+        print(f"  {'ITEM_ID':<38} | {'ANNUAL SUM':>12} | {'TOTAL':>12} | {'DIFF':>10}")
+        print(f"  {'-'*80}")
+        for item_id, s, t, d in alerts[:20]:
+            print(f"  {item_id:<38} | {s:>12.2f} | {t:>12.2f} | {d:>10.2f}")
+        if len(alerts) > 20:
+            print(f"  ... and {len(alerts) - 20} more")
+    else:
+        print(f"  [{label}] All annual sums match totals.")
+
+
+# ---------------------------------------------------------------------------
+# Public functions
+# ---------------------------------------------------------------------------
 
 def migrate_economic_items_AT(mysql_url):
-    mysql_engine = create_engine(mysql_url)
-    
-    print("Starting Economic Items (Technical Assistance) migration...")
+    print("Starting AT Economic Items migration...")
+    engine = create_engine(mysql_url)
+    action_map = _load_action_map(engine)
+    existing = _load_existing_items(engine)
 
-    # Load dependencies
-    try:
-        # Retrieve tracking_code to link with Postgres 'cas'
-        actions_df = pd.read_sql("SELECT id, tracking_code FROM actions", mysql_engine)
-        actions_df['tracking_code'] = actions_df['tracking_code'].astype(str).str.strip()
-        action_map = dict(zip(actions_df['tracking_code'], actions_df['id']))
-
-    except Exception as e:
-        print(f"MySQL dependencies error: {e}")
-        return
-
-    # Read data from Postgres
-    print("Reading from Postgres table dadeseconomiques_at...")
-    df = pd.DataFrame()
-    pg_conn = None
-    try:
-        pg_conn = get_pg_connection()
-        
-        query = """
-            SELECT 
-                cas, 
-                tipologia_assistencia, 
-                codi_tipologia, 
-                import_total 
-            FROM dadeseconomiques_at
-        """
-        df = pd.read_sql(query, pg_conn)
-        print(f"Read {len(df)} rows.")
-        
-    except Exception as e:
-        print(f"Error reading Postgres: {e}")
-        return
-    finally:
-        if pg_conn: pg_conn.close()
-
-    # Data transformation
-    if not df.empty:
-        print("Transforming data...")
-        
-        # Clean tracking code and map action_id
-        df['clean_code'] = pd.to_numeric(df['cas'], errors='coerce').fillna(0).astype(int).astype(str)
-        df['action_id'] = df['clean_code'].map(action_map)
-        
-        # Filter out orphan records
-        df = df.dropna(subset=['action_id'])
-
-        if df.empty:
-            print("No valid records found after mapping.")
-            return
-
-        # Generate fields
-        df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-        
-        # Name and description: Set default if empty, truncated to 191 chars
-        df['name'] = df['tipologia_assistencia'].fillna("Assistència Tècnica").astype(str).str.slice(0, 191)
-        df['description'] = df['tipologia_assistencia'].fillna("").astype(str).str.slice(0, 191)
-        
-        # Map code and hardcode type
-        df['code'] = df['codi_tipologia'] 
-        df['type'] = 'technical-assistance'
-        
-        # Parse amount
-        df['amount'] = pd.to_numeric(df['import_total'], errors='coerce').fillna(0)
-        
-        # Project ID: Left as NULL for now
-        df['project_id'] = None
-
-        # Timestamps
-        df['created_at'] = datetime.now()
-        df['updated_at'] = datetime.now()
-
-        # Final column selection
-        final_cols = ['id', 'name', 'description', 'action_id', 'project_id', 
-                      'code', 'type', 'amount', 'created_at', 'updated_at']
-        df = df[final_cols]
-        
+    print("  Extracting from PostgreSQL...")
+    records = _extract_at_items_pg(action_map)
+    if records:
+        print(f"  PG source: {len(records)} rows")
     else:
-        print("Postgres returned no data.")
-        return
+        records = _extract_at_items_csv(action_map)
+        print(f"  PG CSV fallback: {len(records)} rows")
 
-    # Insert data into MySQL
-    print("Inserting into economic_items table...")
-    try:
-        # Use append to add to existing records
-        df.to_sql('economic_items', con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {len(df)} items inserted.")
-        
-    except Exception as e:
-        print(f"Insertion error: {e}")
+    inserted, skipped = _insert_items(engine, records, existing)
+    print(f"  AT Economic Items: {inserted} inserted, {skipped} already existed.")
 
-
-# OBRA:
-# prové de les dades de la nostra base de dades, de la taula dadeseconomiques_obra
-# name = "Obra"
-# code = "Obra"
-# desciption = "Obra"
-# type = "work"
-# amount = pec_iva
-# action_id = referència a la taula actions, la taula antiga té cas que fa referència al tracking_code de la taula actions, per tant haurem de fer un mapping amb el camp cas de dadeseconomiques_obra com a tracking_code per trobar el uuid de l'acció
-# project_id = DE MOMENT NO RELACIONEM, ELLS NO HO FAN (cercar mateix action_id i mateix codi_tipologia a la taula projects, per trobar el projecte que té aquesta assistència tècnica (a la taula projects, el camp code és el codi_tipologia i el camp action_id és el mateix que l'acció de l'economic_item))
-
-# !!!! M'he trobat que hi ha obres duplicades, s'ha DE REVISAAAAR, però ara mateix em quedaré amb la última fila que apareix a Postgres
 
 def migrate_economic_items_obra(mysql_url):
-    mysql_engine = create_engine(mysql_url)
-    
-    print("Starting Works Economic Items migration (No Duplicates)...")
+    print("Starting Obra Economic Items migration...")
+    engine = create_engine(mysql_url)
+    action_map = _load_action_map(engine)
+    existing = _load_existing_items(engine)
 
-    # Load dependencies
-    print("Loading Actions map...")
-    try:
-        actions_df = pd.read_sql("SELECT id, tracking_code FROM actions", mysql_engine)
-        actions_df['tracking_code'] = actions_df['tracking_code'].astype(str).str.strip()
-        action_map = dict(zip(actions_df['tracking_code'], actions_df['id']))
-    except Exception as e:
-        print(f"MySQL dependencies error: {e}")
-        return
-
-    # Read data from Postgres
-    print("Reading from Postgres table dadeseconomiques_obra...")
-    df = pd.DataFrame()
-    pg_conn = None
-    try:
-        pg_conn = get_pg_connection()
-        query = "SELECT cas, pec_iva FROM dadeseconomiques_obra"
-        df = pd.read_sql(query, pg_conn)
-        print(f"Read {len(df)} rows.")
-    except Exception as e:
-        print(f"Error reading Postgres: {e}")
-        return
-    finally:
-        if pg_conn: pg_conn.close()
-
-    # Data transformation
-    if not df.empty:
-        print("Transforming and deduplicating data...")
-        
-        # Clean tracking code
-        df['clean_code'] = pd.to_numeric(df['cas'], errors='coerce').fillna(0).astype(int).astype(str)
-        
-        # Map action ID
-        df['action_id'] = df['clean_code'].map(action_map)
-        
-        # Filter out orphan records
-        df = df.dropna(subset=['action_id'])
-
-        if df.empty:
-            print("No valid items found after mapping.")
-            return
-
-        # Deduplicate by action_id, keeping the last occurrence
-        before_dedup = len(df)
-        df = df.drop_duplicates(subset=['action_id'], keep='last')
-        after_dedup = len(df)
-        
-        if before_dedup > after_dedup:
-            print(f"Removed {before_dedup - after_dedup} duplicate records.")
-
-        # Generate fields
-        df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-        
-        df['name'] = "Obra"
-        df['description'] = "Obra"
-        df['code'] = "Obra" 
-        df['type'] = 'work'
-        
-        df['amount'] = pd.to_numeric(df['pec_iva'], errors='coerce').fillna(0)
-        df['project_id'] = None
-
-        df['created_at'] = datetime.now()
-        df['updated_at'] = datetime.now()
-
-        final_cols = ['id', 'name', 'description', 'action_id', 'project_id', 
-                      'code', 'type', 'amount', 'created_at', 'updated_at']
-        df = df[final_cols]
-        
+    print("  Extracting from PostgreSQL...")
+    records = _extract_obra_items_pg(action_map)
+    if records:
+        print(f"  PG source: {len(records)} rows")
     else:
-        print("Postgres returned no data.")
-        return
+        records = _extract_obra_items_csv(action_map)
+        print(f"  PG CSV fallback: {len(records)} rows")
 
-    # Insert data into MySQL
-    print("Inserting into economic_items table...")
-    try:
-        df.to_sql('economic_items', con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {len(df)} items inserted.")
-    except Exception as e:
-        print(f"Insertion error: {e}")
-        if "Duplicate entry" in str(e):
-             print("Warning: Possible duplicate entry error on 'code' field.")
+    inserted, skipped = _insert_items(engine, records, existing)
+    print(f"  Obra Economic Items: {inserted} inserted, {skipped} already existed.")
 
-
-# migrar economic_items_anual_budgets:
-# AT
-# prové de les dades de la nostra base de dades, de la taula dadeseconomiques_at_financament_anualitats
-# econoomic_item_id, referència a economic_items, hauré de cercar el projecte i actuacio a la que pertany i cercar aquest parell a economic_items per trobar el id
-# en aquesta taula tenim id_at que es del tipus: XXXX_ATY, on XXXX és el codi de l'actuació i Y és el número de AT, per tant per trobar el economic_item_id hauré de fer un mapping amb el camp id_at de dadeseconomiques_at_financament i el camp code d'economic_items
-# amount = import_anualitat
-# year = anualitat
-# Saltar alertes si la suma de les anualitats no coincideix amb el amount de economic_items, i printejar per pantalla quin cas es i AT.
 
 def migrate_economic_items_anual_budgets_AT(mysql_url):
-    mysql_engine = create_engine(mysql_url)
-    
     print("Starting AT Annual Budgets migration...")
+    engine = create_engine(mysql_url)
+    existing_budgets = _load_existing_budgets(engine)
 
-    # Load reference maps from MySQL
-    print("Loading dependencies...")
-    try:
-        actions_df = pd.read_sql("SELECT id as action_id, tracking_code FROM actions", mysql_engine)
-        actions_df['tracking_code'] = actions_df['tracking_code'].astype(str).str.strip()
-        
-        items_query = """
-            SELECT id as item_uuid, action_id, code as item_code, amount as total_item_amount 
-            FROM economic_items 
-            WHERE type = 'technical-assistance' AND code IS NOT NULL
-        """
-        items_df = pd.read_sql(items_query, mysql_engine)
+    # Build item_lookup: (tracking_code, at_code) -> item_id
+    # and items_with_amounts: item_id -> total_amount  (for validation)
+    with engine.connect() as conn:
+        rows = list(conn.execute(text("""
+            SELECT ei.id, ei.code, ei.amount, a.tracking_code
+            FROM economic_items ei
+            JOIN actions a ON ei.action_id = a.id
+            WHERE ei.type = 'technical-assistance' AND ei.code IS NOT NULL
+        """)))
 
-        # Merge Items with Actions to map tracking_code for cleaner output
-        items_enriched = items_df.merge(actions_df, on='action_id', how='left')
+    item_lookup = {}
+    items_with_amounts = {}
+    for r in rows:
+        tracking_code = str(int(float(r[3]))) if r[3] else None
+        if tracking_code:
+            item_lookup[(tracking_code, str(r[1]).strip())] = r[0]
+            items_with_amounts[r[0]] = float(r[2] or 0)
 
-        print(f"Loaded {len(actions_df)} Actions and {len(items_df)} Items.")
-
-    except Exception as e:
-        print(f"Error loading dependencies: {e}")
-        return
-
-    # Read data from Postgres
-    print("Reading Postgres table dadeseconomiques_at_financament_anualitats...")
-    df = pd.DataFrame()
-    pg_conn = None
-    try:
-        pg_conn = get_pg_connection()
-        query = "SELECT id_at, anualitat, import_anualitat FROM dadeseconomiques_at_financament_anualitats" 
-        df = pd.read_sql(query, pg_conn)
-        print(f"Read {len(df)} rows.")
-    except Exception as e:
-        print(f"Postgres error: {e}")
-        return
-    finally:
-        if pg_conn: pg_conn.close()
-
-    if df.empty: return
-
-    # Data processing and mapping
-    print("Processing IDs...")
-
-    # Extract tracking code and item code from id_at (e.g., "751_AT1")
-    split_data = df['id_at'].str.extract(r'^([^_]+)_(.+)$')
-    df['pg_tracking_code'] = split_data[0]
-    df['pg_item_code'] = split_data[1]
-
-    df['budget_amount'] = pd.to_numeric(df['import_anualitat'], errors='coerce').fillna(0)
-    df['year'] = pd.to_numeric(df['anualitat'], errors='coerce').fillna(0).astype(int)
-
-    # Map ACTION_ID
-    df = df.merge(actions_df, left_on='pg_tracking_code', right_on='tracking_code', how='left')
-    df = df.dropna(subset=['action_id'])
-
-    # Map ITEM_ID
-    df = df.merge(items_df, left_on=['action_id', 'pg_item_code'], right_on=['action_id', 'item_code'], how='left')
-    
-    # Keep only fully mapped valid rows
-    df = df.dropna(subset=['item_uuid'])
-
-    print(f"Valid rows ready for processing: {len(df)}")
-
-    # Validation Alerts
-
-    # Alert 1: Items with a budget but no annual breakdown
-    print("\n[Validation] Checking for items with budget but no annual breakdown...")
-    
-    uuids_with_annuals = set(df['item_uuid'].unique())
-    
-    ghost_items = items_enriched[
-        (~items_enriched['item_uuid'].isin(uuids_with_annuals)) & 
-        (items_enriched['total_item_amount'] > 0.01)
-    ].copy()
-    
-    if not ghost_items.empty:
-        print(f"CRITICAL ALERT: {len(ghost_items)} Items have a budget but no corresponding annual breakdown:")
-        print("-" * 60)
-        print(f"{'ACTION (Tracking)':<20} | {'ITEM CODE':<15} | {'BUDGET (€)':<20}")
-        print("-" * 60)
-        
-        ghost_items = ghost_items.sort_values(by='total_item_amount', ascending=False)
-        
-        for _, row in ghost_items.iterrows():
-            track = str(row['tracking_code'])
-            code = str(row['item_code'])
-            amount = row['total_item_amount']
-            print(f"{track:<20} | {code:<15} | {amount:<20.2f}")
-            
-        print("-" * 60)
-        print("Note: These items will remain in the DB with their total budget, but lacking annual breakdown.")
+    print("  Extracting from PostgreSQL...")
+    records = _extract_at_budgets_pg(item_lookup)
+    if records:
+        print(f"  PG source: {len(records)} rows")
     else:
-        print("Check passed: No orphaned items with a budget found.")
+        records = _extract_at_budgets_csv(item_lookup)
+        print(f"  PG CSV fallback: {len(records)} rows")
 
-    # Alert 2: Annual sums mismatching total item amount
-    print("\n[Validation] Verifying that annual sums match the total item budget...")
-    validation = df.groupby('item_uuid').agg({
-        'budget_amount': 'sum',
-        'total_item_amount': 'first',
-        'id_at': 'first'
-    }).reset_index()
+    _validate_budgets(records, items_with_amounts, "AT")
 
-    sum_alerts = []
-    for _, row in validation.iterrows():
-        annual_sum = row['budget_amount']
-        total_budget = row['total_item_amount']
-        if not np.isclose(annual_sum, total_budget, atol=0.05):
-            sum_alerts.append([row['id_at'], annual_sum, total_budget, annual_sum - total_budget])
+    inserted, skipped = _insert_budgets(engine, records, existing_budgets)
+    print(f"  AT Annual Budgets: {inserted} inserted, {skipped} already existed.")
 
-    sum_alerts.sort(key=lambda x: abs(x[3]), reverse=True)
 
-    if sum_alerts:
-        print(f"ALERT: {len(sum_alerts)} Items where the annual sum does not match the total:")
-        print(f"{'ID_AT':<20} | {'ANNUAL SUM':<15} | {'TOTAL ITEM':<15} | {'DIFFERENCE':<10}")
-        print("-" * 65)
-        for alert in sum_alerts:
-            print(f"{alert[0]:<20} | {alert[1]:<15.2f} | {alert[2]:<15.2f} | {alert[3]:<10.2f}")
-        print("-" * 65)
+def migrate_economic_items_anual_budgets_obra(mysql_url, oracle_config=None):
+    print("Starting Obra Annual Budgets migration...")
+    engine = create_engine(mysql_url)
+    existing_budgets = _load_existing_budgets(engine)
+
+    # Build obra_item_lookup: tracking_code -> item_id
+    with engine.connect() as conn:
+        rows = list(conn.execute(text("""
+            SELECT ei.id, ei.amount, a.tracking_code
+            FROM economic_items ei
+            JOIN actions a ON ei.action_id = a.id
+            WHERE ei.type = 'work'
+        """)))
+
+    obra_item_lookup = {}
+    items_with_amounts = {}
+    for r in rows:
+        tracking_code = str(int(float(r[2]))) if r[2] else None
+        if tracking_code:
+            obra_item_lookup[tracking_code] = r[0]
+            items_with_amounts[r[0]] = float(r[1] or 0)
+
+    print("  Extracting from PostgreSQL...")
+    records = _extract_obra_budgets_pg(obra_item_lookup)
+    if records:
+        print(f"  PG source: {len(records)} rows")
     else:
-        print("Check passed: All sums match correctly.")
+        records = _extract_obra_budgets_csv(obra_item_lookup)
+        print(f"  PG CSV fallback: {len(records)} rows")
 
-    # Data Insertion
-    if df.empty:
-        print("\nNo data available to insert.")
-        return
+    _validate_budgets(records, items_with_amounts, "Obra")
 
-    df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-    df['created_at'] = datetime.now()
-    df['updated_at'] = datetime.now()
-    df['economic_item_id'] = df['item_uuid']
-    df['amount'] = df['budget_amount']
-
-    final_cols = ['id', 'economic_item_id', 'amount', 'year', 'created_at', 'updated_at']
-    df_final = df[final_cols]
-
-    print("\nInserting data into 'economic_item_anual_budgets'...")
-    try:
-        table_name = 'economic_item_anual_budgets'
-        df_final.to_sql(table_name, con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {len(df_final)} rows inserted.")
-    except Exception as e:
-        print(f"Insertion error: {e}")
-
-
-# Obra:
-# prové de les dades de la nostra base de dades, de la taula dadeseconomiques_obra_financament
-# econoomic_item_id, referència a economic_items, hauré de cercar el projecte i actuacio a la que pertany i cercar aquest parell a economic_items per trobar el id
-# en aquesta taula tenim cas que es del tipus: XXXX, on XXXX és el codi de l'actuació, per tant per trobar el economic_item_id hauré de fer un mapping de l'actuació que li toca i que a name fiqui "Obra"
-# amount = import_anualitat
-# year = anualitat
-
-def migrate_economic_items_anual_budgets_obra(mysql_url, oracle_config):
-    mysql_engine = create_engine(mysql_url)
-    
-    print("Starting Works Annual Budgets migration...")
-
-    # Load reference maps from MySQL
-    print("Loading dependencies...")
-    try:
-        actions_df = pd.read_sql("SELECT id as action_id, tracking_code FROM actions", mysql_engine)
-        actions_df['tracking_code'] = actions_df['tracking_code'].astype(str).str.strip()
-        
-        # Filter for 'work' items or items named 'Obra'
-        items_query = """
-            SELECT id as item_uuid, action_id, code as item_code, amount as total_item_amount 
-            FROM economic_items 
-            WHERE type = 'work' OR name = 'Obra'
-        """
-        items_df = pd.read_sql(items_query, mysql_engine)
-
-        # Merge with actions to make alerts readable by tracking code
-        items_enriched = items_df.merge(actions_df, on='action_id', how='left')
-
-        print(f"Loaded {len(actions_df)} Actions and {len(items_df)} Works Items.")
-
-    except Exception as e:
-        print(f"Error loading dependencies: {e}")
-        return
-
-    # Read data from Postgres
-    print("Reading from Postgres table dadeseconomiques_obra_financament...")
-    df = pd.DataFrame()
-    pg_conn = None
-    try:
-        pg_conn = get_pg_connection()
-        query = "SELECT cas, anualitat, import_anualitat FROM dadeseconomiques_obra_financament" 
-        df = pd.read_sql(query, pg_conn)
-        print(f"Read {len(df)} rows.")
-    except Exception as e:
-        print(f"Postgres error: {e}")
-        return
-    finally:
-        if pg_conn: pg_conn.close()
-
-    if df.empty: return
-
-    # Data processing and mapping
-    print("Processing IDs...")
-
-    # Extract tracking code
-    df['pg_tracking_code'] = pd.to_numeric(df['cas'], errors='coerce').fillna(0).astype(int).astype(str)
-    
-    df['budget_amount'] = pd.to_numeric(df['import_anualitat'], errors='coerce').fillna(0)
-    df['year'] = pd.to_numeric(df['anualitat'], errors='coerce').fillna(0).astype(int)
-
-    # Map ACTION_ID
-    df = df.merge(actions_df, left_on='pg_tracking_code', right_on='tracking_code', how='left')
-    
-    df = df.dropna(subset=['action_id'])
-
-    # Map ITEM_ID using action_id
-    df = df.merge(items_df, on='action_id', how='left')
-    
-    # Keep valid rows
-    df = df.dropna(subset=['item_uuid'])
-
-    print(f"Valid rows ready for processing: {len(df)}")
-
-    # Validation Alerts
-
-    # Alert 1: Works items with a budget but no annual breakdown
-    print("\n[Validation] Checking for Works items with budget but no annual breakdown...")
-    
-    uuids_with_annuals = set(df['item_uuid'].unique())
-    
-    ghost_items = items_enriched[
-        (~items_enriched['item_uuid'].isin(uuids_with_annuals)) & 
-        (items_enriched['total_item_amount'] > 0.01)
-    ].copy()
-    
-    if not ghost_items.empty:
-        print(f"CRITICAL ALERT: {len(ghost_items)} Works items have a budget but no corresponding annual breakdown:")
-        print("-" * 60)
-        print(f"{'ACTION (Tracking)':<20} | {'BUDGET (€)':<20}")
-        print("-" * 60)
-        
-        ghost_items = ghost_items.sort_values(by='total_item_amount', ascending=False)
-        for _, row in ghost_items.iterrows():
-            track = str(row['tracking_code'])
-            amount = row['total_item_amount']
-            print(f"{track:<20} | {amount:<20.2f}")
-            
-        print("-" * 60)
-    else:
-        print("Check passed: No orphaned Works items with a budget found.")
-
-    # Alert 2: Annual sums mismatching total Works item amount
-    print("\n[Validation] Verifying that annual sums match the total Works budget...")
-    validation = df.groupby('item_uuid').agg({
-        'budget_amount': 'sum',
-        'total_item_amount': 'first',
-        'pg_tracking_code': 'first'
-    }).reset_index()
-
-    sum_alerts = []
-    for _, row in validation.iterrows():
-        annual_sum = row['budget_amount']
-        total_budget = row['total_item_amount']
-        if not np.isclose(annual_sum, total_budget, atol=0.05):
-            sum_alerts.append([row['pg_tracking_code'], annual_sum, total_budget, annual_sum - total_budget])
-
-    sum_alerts.sort(key=lambda x: abs(x[3]), reverse=True)
-
-    if sum_alerts:
-        print(f"ALERT: {len(sum_alerts)} Works items where the annual sum does not match the total:")
-        print(f"{'CASE':<10} | {'ANNUAL SUM':<15} | {'TOTAL WORKS':<15} | {'DIFFERENCE':<10}")
-        print("-" * 55)
-        for alert in sum_alerts:
-            print(f"{alert[0]:<10} | {alert[1]:<15.2f} | {alert[2]:<15.2f} | {alert[3]:<10.2f}")
-        print("-" * 55)
-    else:
-        print("Check passed: All sums match correctly.")
-
-    # Data Insertion
-    if df.empty:
-        print("\nNo data available to insert.")
-        return
-
-    df['id'] = [str(uuid.uuid4()) for _ in range(len(df))]
-    df['created_at'] = datetime.now()
-    df['updated_at'] = datetime.now()
-    
-    df['economic_item_id'] = df['item_uuid']
-    df['amount'] = df['budget_amount']
-
-    final_cols = ['id', 'economic_item_id', 'amount', 'year', 'created_at', 'updated_at']
-    df_final = df[final_cols]
-
-    print("\nInserting data into 'economic_item_anual_budgets'...")
-    try:
-        table_name = 'economic_item_anual_budgets'
-        df_final.to_sql(table_name, con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {len(df_final)} rows inserted.")
-    except Exception as e:
-        print(f"Insertion error: {e}")
+    inserted, skipped = _insert_budgets(engine, records, existing_budgets)
+    print(f"  Obra Annual Budgets: {inserted} inserted, {skipped} already existed.")

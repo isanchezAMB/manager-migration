@@ -4,6 +4,50 @@ import pandas as pd
 import json
 
 
+# Tablas de referencia que vienen precargadas por la empresa externa
+# Se copian de la BD de referencia (source_url) a la BD destino (mysql_url)
+REFERENCE_TABLES = [
+    "action_types",
+    "cities",
+    "project_types",
+    "assistance_types",
+    "sub_task_types",
+    "request_channels",
+    "priorities",
+    "roles",
+    # BPM definitions (order matters: process → task/gateways/events → flows → gpo_phase_activities)
+    "core_bpm_definitions_process",
+    "core_bpm_definitions_task",
+    "core_bpm_definitions_gateways",
+    "core_bpm_definitions_events",
+    "core_bpm_definitions_flows",
+    "gpo_phases",
+    "gpo_phase_triggers",
+    "gpo_phase_activities",
+]
+
+
+def copy_reference_tables(source_url, target_url):
+    """Copia las tablas de referencia de source a target. Idempotente: trunca y recarga."""
+    src = create_engine(source_url)
+    dst = create_engine(target_url)
+
+    for table in REFERENCE_TABLES:
+        with src.connect() as s, dst.connect() as d:
+            rows = s.execute(text(f"SELECT * FROM `{table}`")).mappings().all()
+            d.execute(text(f"SET FOREIGN_KEY_CHECKS = 0"))
+            d.execute(text(f"TRUNCATE TABLE `{table}`"))
+            d.execute(text(f"SET FOREIGN_KEY_CHECKS = 1"))
+            if rows:
+                cols = list(rows[0].keys())
+                col_names = ", ".join(f"`{c}`" for c in cols)
+                placeholders = ", ".join(f":{c}" for c in cols)
+                for row in rows:
+                    d.execute(text(f"INSERT INTO `{table}` ({col_names}) VALUES ({placeholders})"), dict(row))
+            d.commit()
+            print(f"  {table}: {len(rows)} rows copied.")
+
+
 
 # Function to export only cases with planification data to a JSON file
 def json_cases_planificacions():
@@ -49,15 +93,17 @@ def clean_database(mysql_url):
 
     # List of tables to clean
     tables_to_clean = [
-        "economic_item_anual_budgets", 
-        "economic_items",              
-        "certifications",              
-        "projects",                    
-        "actions",                     
-        "services",                     
+        "economic_item_anual_budgets",
+        "economic_items",
+        "certifications",
+        "projects",
+        "fundings",
+        "action_program",
         "action_city",
+        "actions",
+        "services",
+        "users",
         "programs",
-        "action_program"
     ]
 
     try:

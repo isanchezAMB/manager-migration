@@ -1,293 +1,441 @@
-from datetime import datetime
+import csv
+import json
 import uuid
-from flask import json
-import pandas as pd
 import oracledb
-from sqlalchemy import create_engine
+from datetime import datetime
+from sqlalchemy import create_engine, text
 
 
-#AT
-# Les dades provenen de PIO_FACTURACIOX on X, s'haurà d'interar de l'1 al 20.
-# Per mirar a quin project correpont hem de fer el següent:
-# A la taula PIO_FACTURACIOX mirar el camp PROJECTE i relacionar aquest camp amb el camp PROJECTE de la taula PIO_ACTUACIONS, així trobem el tracking_code que es el camp CASEID a la taula PIO_ACTUACIONS
-# Un cop tenim el tracking_code, el relacionem amb la taula actions per trobar el id de l'acció
-# Un cop tenim el id de l'acció, cerquem a la taula projects un projecte que tingui aquest action_id i tingui com a name "ATX", on X és l'int de l'AT i ens quedem amb el project_id
-# project_id = referència a la taula projects
-# month = Mirem si a concepte surt un mes i ens quedem amb el primer que aparegui, si no surt cap, el deixem a null
-# net_amount = IMPORTFACTURAR
-# amount = IMPORTFACTURAR * 0.79 (Sense IVA) 
-# certification_date = DATAFACTURA
-# Per relacionar la certificació amb l'AT fem un JOIN amb PIO_TASQUES
-# A PIO_TASQUES tenim uns strings que fem mapping en un json amb les ATX.
+MONTHS_CA = ["gener", "febrer", "març", "abril", "maig", "juny",
+             "juliol", "agost", "setembre", "octubre", "novembre", "desembre"]
 
-def migrate_certifications_AT(mysql_url, oracle_config, json_file):
-    print("Starting AT Certifications migration...")
-    
-    mysql_engine = create_engine(mysql_url)
+MONTH_PATTERN = r'(?i)\b(gener|febrer|març|abril|maig|juny|juliol|agost|setembre|octubre|novembre|desembre)\b'
 
-    # Prepare reverse JSON map (Task -> ATX)
-    tasca_to_at_map = {}
-    with open(json_file, 'r', encoding='utf-8') as f:
-        json_at = json.load(f)
-        
-    for at_key, tasques in json_at.items():
-        for t in tasques:
-            if t not in tasca_to_at_map:
-                tasca_to_at_map[t] = at_key
 
-    # Load MySQL context
-    print("Loading MySQL maps (Actions and Projects)...")
+def _month_from_text(text_val):
+    if not text_val:
+        return None
+    import re
+    m = re.search(MONTH_PATTERN, str(text_val))
+    return m.group(1).lower() if m else None
+
+
+def _month_from_date(date_val):
+    if not date_val:
+        return None
     try:
-        actions_df = pd.read_sql("SELECT id, tracking_code FROM actions", mysql_engine)
-        actions_df['clean_code'] = pd.to_numeric(actions_df['tracking_code'], errors='coerce').fillna(0).astype(int).astype(str)
-        action_map = dict(zip(actions_df['clean_code'], actions_df['id']))
+        if hasattr(date_val, "month"):
+            return MONTHS_CA[date_val.month - 1]
+        dt = datetime.strptime(str(date_val)[:10], "%Y-%m-%d")
+        return MONTHS_CA[dt.month - 1]
+    except Exception:
+        return None
 
-        proj_df = pd.read_sql("SELECT id, action_id, code FROM projects", mysql_engine)
-        proj_df['code_clean'] = proj_df['code'].astype(str).str.strip()
-        project_lookup = dict(zip(zip(proj_df['action_id'], proj_df['code_clean']), proj_df['id']))
 
-    except Exception as e:
-        print(f"Error loading MySQL dependencies: {e}")
-        return
+def _load_mysql_maps(engine):
+    with engine.connect() as conn:
+        action_map = {
+            str(int(float(r[0]))): r[1]
+            for r in conn.execute(text(
+                "SELECT tracking_code, id FROM actions WHERE tracking_code IS NOT NULL"
+            ))
+        }
+        project_lookup = {
+            (r[0], str(r[1]).strip()): r[2]
+            for r in conn.execute(text(
+                "SELECT action_id, code, id FROM projects WHERE action_id IS NOT NULL AND code IS NOT NULL"
+            ))
+        }
+        existing = {
+            (r[0], str(r[1])[:10], str(r[2]))
+            for r in conn.execute(text(
+                "SELECT project_id, certification_date, net_amount FROM certifications"
+            ))
+        }
+    return action_map, project_lookup, existing
 
-    # Oracle Connection and Processing
-    try:
-        with oracledb.connect(**oracle_config) as ora_conn:
-            print("Connected to Oracle.")
 
-            q_bridge = "SELECT PROJECTE, CASEID FROM PIO_ACTUACIONS"
-            bridge_df = pd.read_sql(q_bridge, ora_conn)
-            bridge_df['proj_clean'] = pd.to_numeric(bridge_df['PROJECTE'], errors='coerce').fillna(0).astype(int).astype(str)
-            bridge_df['case_clean'] = pd.to_numeric(bridge_df['CASEID'], errors='coerce').fillna(0).astype(int).astype(str)
-            oracle_bridge_map = dict(zip(bridge_df['proj_clean'], bridge_df['case_clean']))
-            
-            total_migrated = 0
+def _insert_certifications(engine, records, existing):
+    now = datetime.now()
+    inserted = skipped = 0
+    with engine.connect() as conn:
+        for r in records:
+            key = (r["project_id"], str(r["certification_date"])[:10], str(r["net_amount"]))
+            if key in existing:
+                skipped += 1
+                continue
+            existing.add(key)
+            conn.execute(text("""
+                INSERT INTO certifications
+                    (id, project_id, month, amount, net_amount, certification_date, created_at, updated_at)
+                VALUES
+                    (:id, :project_id, :month, :amount, :net_amount, :certification_date, :created_at, :updated_at)
+            """), {**r, "created_at": now, "updated_at": now})
+            inserted += 1
+        conn.commit()
+    return inserted, skipped
 
-            # Iterate through billing tables
+
+# ---------------------------------------------------------------------------
+# AT — Oracle
+# ---------------------------------------------------------------------------
+
+def _extract_at_oracle(oracle_config, action_map, project_lookup, tasca_to_at):
+    records = []
+
+    AMOUNT_COLS = ["IMPORTFACTURAR", "IMPORTFACTURAT", "IMPORTFACTURA"]
+    DATE_COLS = ["DATAFACTURA", "DATAFACTURACIO"]
+
+    with oracledb.connect(**oracle_config) as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT PROJECTE, CASEID FROM PIO_ACTUACIONS WHERE PROJECTE IS NOT NULL AND CASEID IS NOT NULL")
+        proj_to_case = {str(int(float(r[0]))): str(int(float(r[1]))) for r in cursor.fetchall()}
+
+        cursor.execute("SELECT IDTASQUES, NOMTASCA FROM PIO_TASQUES")
+        tasques = {str(int(float(r[0]))): (r[1] or "").strip() for r in cursor.fetchall()}
+
+        cursor.execute("SELECT IDPROJECTE, " + ", ".join(f"TASCAFACTURACIO{i}" for i in range(1, 21)) + " FROM PIO_PROJECTE")
+        proj_slot_map = {}
+        for row in cursor.fetchall():
+            idproj = str(int(float(row[0]))) if row[0] else None
+            if not idproj:
+                continue
+            for i, val in enumerate(row[1:], start=1):
+                if val:
+                    tasca_id = str(int(float(val)))
+                    nomtasca = tasques.get(tasca_id, "")
+                    at_code = tasca_to_at.get(nomtasca)
+                    proj_slot_map[(idproj, i)] = (nomtasca, at_code)
+
+        for i in range(1, 21):
+            table = f"PIO_FACTURACIO{i}" if i != 3 else "FACTURACIO3"
+
+            # Discover column names
+            try:
+                cursor.execute(f"SELECT * FROM {table} WHERE ROWNUM = 1")
+                cols = [d[0] for d in cursor.description]
+            except Exception:
+                continue
+
+            amount_col = next((c for c in AMOUNT_COLS if c in cols), None)
+            date_col = next((c for c in DATE_COLS if c in cols), None)
+            if not amount_col or not date_col:
+                print(f"  {table}: cannot find amount/date columns, skipping")
+                continue
+
+            try:
+                cursor.execute(f"SELECT PROJECTE, {amount_col}, {date_col}, CONCEPTE FROM {table}")
+                rows = cursor.fetchall()
+            except Exception as e:
+                print(f"  {table}: query failed ({e}), skipping")
+                continue
+
+            for row in rows:
+                proj_ora = str(int(float(row[0]))) if row[0] else None
+                if not proj_ora:
+                    continue
+                caseid = proj_to_case.get(proj_ora)
+                if not caseid:
+                    continue
+                action_id = action_map.get(caseid)
+                if not action_id:
+                    continue
+
+                slot_info = proj_slot_map.get((proj_ora, i))
+                if not slot_info or not slot_info[1]:
+                    continue
+                at_code = slot_info[1]
+                project_id = project_lookup.get((action_id, at_code))
+                if not project_id:
+                    continue
+
+                import_base = float(row[1]) if row[1] is not None else None
+                if import_base is None:
+                    continue
+
+                cert_date = row[2]
+                concepte = row[3]
+
+                month = _month_from_text(concepte) or _month_from_date(cert_date)
+                if not month:
+                    month = _month_from_date(cert_date)
+                if not month:
+                    month = "desconegut"
+
+                records.append({
+                    "id": str(uuid.uuid4()),
+                    "project_id": project_id,
+                    "month": month,
+                    "net_amount": round(import_base, 2),
+                    "amount": round(import_base * 1.21, 2),
+                    "certification_date": cert_date,
+                })
+
+        cursor.close()
+    return records
+
+
+# ---------------------------------------------------------------------------
+# AT — CSV fallback
+# ---------------------------------------------------------------------------
+
+def _extract_at_csv(action_map, project_lookup, tasca_to_at):
+    records = []
+
+    # proj_to_case
+    proj_to_case = {}
+    with open("data/oracle_export/PIO_ACTUACIONS.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            proj = str(row.get("PROJECTE", "")).split(".")[0].strip()
+            caseid = str(row.get("CASEID", "")).strip()
+            if proj and caseid:
+                proj_to_case[proj] = caseid
+
+    # tasques
+    tasques = {}
+    with open("data/oracle_export/PIO_TASQUES.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            tasques[str(row.get("IDTASQUES", "")).strip()] = row.get("NOMTASCA", "").strip()
+
+    # proj_slot_map
+    proj_slot_map = {}
+    with open("data/oracle_export/PIO_PROJECTE.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            idproj = str(row.get("IDPROJECTE", "")).strip()
+            if not idproj:
+                continue
             for i in range(1, 21):
-                table_name = f"PIO_FACTURACIO{i}"
-                if i == 3:
-                    table_name = "FACTURACIO3"
-                    
-                print(f"Processing {table_name}...")
+                val = str(row.get(f"TASCAFACTURACIO{i}", "")).split(".")[0].strip()
+                if val:
+                    nomtasca = tasques.get(val, "")
+                    at_code = tasca_to_at.get(nomtasca)
+                    proj_slot_map[(idproj, i)] = (nomtasca, at_code)
 
-                try:
-                    query = f"""
-                        SELECT 
-                            F.PROJECTE, 
-                            F.IMPORTFACTURAR AS IMPORT_BASE, 
-                            F.DATAFACTURA, 
-                            F.CONCEPTE,
-                            T.NOMTASCA
-                        FROM {table_name} F
-                        LEFT JOIN PIO_PROJECTE P ON F.PROJECTE = P.IDPROJECTE
-                        LEFT JOIN PIO_TASQUES T ON P.TASCAFACTURACIO{i} = T.IDTASQUES
-                    """
-                    df_fact = pd.read_sql(query, ora_conn)
-                except Exception:
+    AMOUNT_COLS = ["IMPORTFACTURAR", "IMPORTFACTURAT", "IMPORTFACTURA"]
+    DATE_COLS = ["DATAFACTURA", "DATAFACTURACIO"]
+
+    for i in range(1, 21):
+        fname = f"PIO_FACTURACIO{i}" if i != 3 else "FACTURACIO3"
+        path = f"data/oracle_export/{fname}.csv"
+        try:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
+                reader = csv.DictReader(f)
+                cols = reader.fieldnames or []
+                amount_col = next((c for c in AMOUNT_COLS if c in cols), None)
+                date_col = next((c for c in DATE_COLS if c in cols), None)
+                if not amount_col or not date_col:
+                    print(f"  {fname}.csv: cannot find amount/date columns, skipping")
+                    continue
+                for row in reader:
+                    proj_ora = str(row.get("PROJECTE", "")).split(".")[0].strip()
+                    if not proj_ora:
+                        continue
+                    caseid = proj_to_case.get(proj_ora)
+                    if not caseid:
+                        continue
+                    action_id = action_map.get(caseid)
+                    if not action_id:
+                        continue
+                    slot_info = proj_slot_map.get((proj_ora, i))
+                    if not slot_info or not slot_info[1]:
+                        continue
+                    at_code = slot_info[1]
+                    project_id = project_lookup.get((action_id, at_code))
+                    if not project_id:
+                        continue
+
+                    raw_amount = str(row.get(amount_col, "")).strip()
                     try:
-                        query = f"""
-                            SELECT 
-                                F.PROJECTE, 
-                                F.IMPORTFACTURAT AS IMPORT_BASE, 
-                                F.DATAFACTURA, 
-                                F.CONCEPTE,
-                                T.NOMTASCA
-                            FROM {table_name} F
-                            LEFT JOIN PIO_PROJECTE P ON F.PROJECTE = P.IDPROJECTE
-                            LEFT JOIN PIO_TASQUES T ON P.TASCAFACTURACIO{i} = T.IDTASQUES
-                        """
-                        df_fact = pd.read_sql(query, ora_conn)
+                        import_base = float(raw_amount)
+                    except ValueError:
+                        continue
+
+                    cert_date_str = str(row.get(date_col, "")).strip()
+                    try:
+                        cert_date = datetime.strptime(cert_date_str[:10], "%Y-%m-%d").date()
                     except Exception:
-                        try:
-                            query = f"""
-                                SELECT 
-                                    F.PROJECTE, 
-                                    F.IMPORTFACTURA AS IMPORT_BASE, 
-                                    F.DATAFACTURA, 
-                                    F.CONCEPTE,
-                                    T.NOMTASCA
-                                FROM {table_name} F
-                                LEFT JOIN PIO_PROJECTE P ON F.PROJECTE = P.IDPROJECTE
-                                LEFT JOIN PIO_TASQUES T ON P.TASCAFACTURACIO{i} = T.IDTASQUES
-                            """
-                            df_fact = pd.read_sql(query, ora_conn)
-                        except Exception:
-                            try:
-                                query = f"""
-                                    SELECT 
-                                        F.PROJECTE, 
-                                        F.IMPORTFACTURAT AS IMPORT_BASE, 
-                                        F.DATAFACTURACIO AS DATAFACTURA, 
-                                        F.CONCEPTE,
-                                        T.NOMTASCA
-                                    FROM {table_name} F
-                                    LEFT JOIN PIO_PROJECTE P ON F.PROJECTE = P.IDPROJECTE
-                                    LEFT JOIN PIO_TASQUES T ON P.TASCAFACTURACIO{i} = T.IDTASQUES
-                                """
-                                df_fact = pd.read_sql(query, ora_conn)
-                            except Exception:
-                                print(f"Could not read {table_name}. Skipping.")
-                                continue
+                        continue
 
-                if df_fact.empty:
-                    print(f"Table {table_name} is empty.")
-                    continue
+                    concepte = row.get("CONCEPTE", "")
+                    month = _month_from_text(concepte) or _month_from_date(cert_date) or "desconegut"
 
-                # ID cleaning and mapping
-                df_fact['proj_ora_clean'] = pd.to_numeric(df_fact['PROJECTE'], errors='coerce').fillna(0).astype(int).astype(str)
-                df_fact['nomtasca_clean'] = df_fact['NOMTASCA'].fillna("").astype(str).str.strip()
+                    records.append({
+                        "id": str(uuid.uuid4()),
+                        "project_id": project_id,
+                        "month": month,
+                        "net_amount": round(import_base, 2),
+                        "amount": round(import_base * 1.21, 2),
+                        "certification_date": cert_date,
+                    })
+        except FileNotFoundError:
+            print(f"  {fname}.csv not found, skipping slot {i}")
 
-                df_fact['tracking_code'] = df_fact['proj_ora_clean'].map(oracle_bridge_map)
-                df_fact['action_id'] = df_fact['tracking_code'].map(action_map)
-                df_fact['target_project_name'] = df_fact['nomtasca_clean'].map(tasca_to_at_map)
-
-                def find_project_id(row):
-                    if pd.isna(row['action_id']) or pd.isna(row['target_project_name']): 
-                        return None
-                    key = (row['action_id'], row['target_project_name'])
-                    return project_lookup.get(key)
-
-                df_fact['project_id'] = df_fact.apply(find_project_id, axis=1)
-
-                # Filter valid projects
-                df_final = df_fact.dropna(subset=['project_id']).copy()
-
-                if df_final.empty:
-                    print("No valid invoices to cross-reference.")
-                    continue
-
-                # Extract month
-                month_pattern = r'(?i)\b(gener|febrer|març|abril|maig|juny|juliol|agost|setembre|octubre|novembre|desembre)\b'
-                df_final['CONCEPTE_STR'] = df_final['CONCEPTE'].fillna("").astype(str)
-                df_final['month'] = df_final['CONCEPTE_STR'].str.extract(month_pattern, expand=False).str.lower()
-
-                # Generate final fields
-                df_final['id'] = [str(uuid.uuid4()) for _ in range(len(df_final))]
-                df_final['net_amount'] = df_final['IMPORT_BASE']
-                df_final['amount'] = df_final['IMPORT_BASE'] * 0.79 
-                df_final['certification_date'] = pd.to_datetime(df_final['DATAFACTURA'])
-                df_final['created_at'] = datetime.now()
-                df_final['updated_at'] = datetime.now()
-                
-                cols_to_insert = [
-                    'id', 'project_id', 'month', 'amount', 'net_amount', 
-                    'certification_date', 'created_at', 'updated_at'
-                ]
-                
-                # Insert into MySQL
-                df_final[cols_to_insert].to_sql('certifications', con=mysql_engine, if_exists='append', index=False)
-                
-                count = len(df_final)
-                total_migrated += count
-                print(f"Inserted {count} dynamically assigned certifications.")
-
-            print(f"\nMIGRATION COMPLETED. Total certifications: {total_migrated}")
-
-    except Exception as e:
-        print(f"Fatal Error: {e}")
+    return records
 
 
+# ---------------------------------------------------------------------------
+# Obra — Oracle
+# ---------------------------------------------------------------------------
 
-# migrar certifications:
-# Obra:
-# prové de PIO. PIO_CERTIFICACIONS
-# Per mirar a quin project correpont hem de fer el següent:
-# A la taula PIO_CERTIFICACIONS mirar el camp OBRA i relacionar aquest camp amb el camp OBRA de la taula PIO_ACTUACIONS, així trobem el tracking_code que es el camp CASEID a la taula PIO_ACTUACIONS
-# Un cop tenim el tracking_code, el relacionem amb la taula actions per trobar el id de l'acció
-# Un cop tenim el id de l'acció, cerquem a la taula projects un projecte que tingui aquest action_id i tingui com a name "Obra" i ens quedem amb el project_id
-# project_id = referència a la taula projects
-# month = MESCERTIFICACIO
-# net_amount = IMPORTAMBIVA
-# amount = IMPORTAMBIVA * 0.79 (Sense IVA)
-# certification_date = DATACERTIFICACIO
+def _extract_obra_oracle(oracle_config, action_map, project_lookup):
+    records = []
+    with oracledb.connect(**oracle_config) as conn:
+        cursor = conn.cursor()
 
-def migrate_certifications_obra(mysql_url, oracle_config):
-    mysql_engine = create_engine(mysql_url)
-    
-    print("Starting Certifications migration (Oracle PIO -> MySQL)...")
+        cursor.execute("SELECT OBRA, CASEID FROM PIO_ACTUACIONS WHERE OBRA IS NOT NULL AND CASEID IS NOT NULL")
+        obra_to_case = {}
+        for obra, caseid in cursor.fetchall():
+            obra_val = str(int(float(obra)))
+            if obra_val and obra_val != "0":
+                obra_to_case[obra_val] = str(int(float(caseid)))
 
-    # Load MySQL dependencies
-    try:
-        actions_df = pd.read_sql("SELECT id as action_id, tracking_code FROM actions", mysql_engine)
-        actions_df['tracking_code'] = actions_df['tracking_code'].astype(str).str.strip()
-        
-        proj_query = "SELECT id as project_id, action_id FROM projects WHERE name = 'Obra'"
-        projects_df = pd.read_sql(proj_query, mysql_engine)
+        cursor.execute("SELECT OBRA, MESCERTIFICACIO, IMPORTAMBIVA, DATACERTIFICACIO FROM PIO_CERTIFICACIONS")
+        for row in cursor.fetchall():
+            obra_val = str(int(float(row[0]))) if row[0] else None
+            if not obra_val:
+                continue
+            caseid = obra_to_case.get(obra_val)
+            if not caseid:
+                continue
+            action_id = action_map.get(caseid)
+            if not action_id:
+                continue
+            project_id = project_lookup.get((action_id, "Obra"))
+            if not project_id:
+                continue
 
-    except Exception as e:
-        print(f"Error loading MySQL dependencies: {e}")
-        return
+            import_amb_iva = float(row[1]) if row[1] is not None else None
+            # MESCERTIFICACIO is index 1 but field order is OBRA, MESCERTIFICACIO, IMPORTAMBIVA, DATACERTIFICACIO
+            mes = row[1]
+            import_amb_iva = float(row[2]) if row[2] is not None else None
+            cert_date = row[3]
 
-    # Read from Oracle
-    print("Connecting to Oracle and reading tables...")
-    df_cert = pd.DataFrame()
-    df_act = pd.DataFrame()
-    
-    try:
-        with oracledb.connect(**oracle_config) as ora_conn:
-            q_cert = "SELECT OBRA, MESCERTIFICACIO, IMPORTAMBIVA, DATACERTIFICACIO FROM PIO_CERTIFICACIONS"
-            df_cert = pd.read_sql(q_cert, ora_conn)
+            if import_amb_iva is None:
+                continue
 
-            q_act = "SELECT OBRA, CASEID FROM PIO_ACTUACIONS"
-            df_act = pd.read_sql(q_act, ora_conn)
+            month = _month_from_text(mes) or _month_from_date(cert_date) or "desconegut"
 
-    except Exception as e:
-        print(f"Oracle connection error: {e}")
-        return
+            records.append({
+                "id": str(uuid.uuid4()),
+                "project_id": project_id,
+                "month": month,
+                "net_amount": round(import_amb_iva / 1.21, 2),
+                "amount": round(import_amb_iva, 2),
+                "certification_date": cert_date,
+            })
+        cursor.close()
+    return records
 
-    if df_cert.empty: return
 
-    # Cross-reference data
-    print("Cross-referencing data...")
+# ---------------------------------------------------------------------------
+# Obra — CSV fallback
+# ---------------------------------------------------------------------------
 
-    merged_pio = df_cert.merge(df_act, on='OBRA', how='left')
-    merged_pio['clean_tracking'] = merged_pio['CASEID'].astype(str).str.strip()
-    
-    merged_pio = merged_pio.merge(actions_df, left_on='clean_tracking', right_on='tracking_code', how='left')
-    merged_pio = merged_pio.dropna(subset=['action_id'])
+def _extract_obra_csv(action_map, project_lookup):
+    records = []
 
-    final_df = merged_pio.merge(projects_df, on='action_id', how='left')
-    final_df = final_df.dropna(subset=['project_id'])
+    obra_to_case = {}
+    with open("data/oracle_export/PIO_ACTUACIONS.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            caseid = str(row.get("CASEID", "")).strip()
+            obra = str(row.get("OBRA", "")).split(".")[0].strip()
+            if obra and obra != "0" and caseid:
+                obra_to_case[obra] = caseid
 
-    if final_df.empty: 
-        print("No valid rows to insert.")
-        return
+    with open("data/oracle_export/PIO_CERTIFICACIONS.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            obra_val = str(row.get("OBRA", "")).split(".")[0].strip()
+            if not obra_val:
+                continue
+            caseid = obra_to_case.get(obra_val)
+            if not caseid:
+                continue
+            action_id = action_map.get(caseid)
+            if not action_id:
+                continue
+            project_id = project_lookup.get((action_id, "Obra"))
+            if not project_id:
+                continue
 
-    # Print summary of tracking codes
-    print("\nSUMMARY OF ACTIONS TO BE INSERTED:")
-    print(f"{'TRACKING CODE':<20} | {'CERTIFICATIONS COUNT':<20}")
-    print("-" * 45)
-    
-    summary = final_df['clean_tracking'].value_counts().reset_index()
-    summary.columns = ['code', 'count']
-    
-    for index, row in summary.iterrows():
-        print(f"{row['code']:<20} | {row['count']:<20}")
-    
-    print("-" * 45)
-    print(f"TOTAL UNIQUE ACTIONS: {len(summary)}\n")
+            raw = str(row.get("IMPORTAMBIVA", "")).strip()
+            try:
+                import_amb_iva = float(raw)
+            except ValueError:
+                continue
 
-    # Final data transformation
-    final_df['id'] = [str(uuid.uuid4()) for _ in range(len(final_df))]
-    month_pattern = r'(?i)\b(gener|febrer|març|abril|maig|juny|juliol|agost|setembre|octubre|novembre|desembre)\b'
-    
-    final_df['MESCERTIFICACIO_STR'] = final_df['MESCERTIFICACIO'].fillna("").astype(str)
-    
-    final_df['month'] = final_df['MESCERTIFICACIO_STR'].str.extract(month_pattern, expand=False).str.lower()
-    final_df['net_amount'] = pd.to_numeric(final_df['IMPORTAMBIVA'], errors='coerce').fillna(0)
-    final_df['amount'] = final_df['net_amount'] / 0.79
-    final_df['certification_date'] = pd.to_datetime(final_df['DATACERTIFICACIO'], errors='coerce')
-    final_df['created_at'] = datetime.now()
-    final_df['updated_at'] = datetime.now()
+            cert_date_str = str(row.get("DATACERTIFICACIO", "")).strip()
+            try:
+                cert_date = datetime.strptime(cert_date_str[:10], "%Y-%m-%d").date()
+            except Exception:
+                continue
 
-    cols_to_insert = ['id', 'project_id', 'month', 'amount', 'net_amount', 'certification_date', 'created_at', 'updated_at']
-    df_upload = final_df[cols_to_insert]
+            mes = row.get("MESCERTIFICACIO", "")
+            month = _month_from_text(mes) or _month_from_date(cert_date) or "desconegut"
 
-    # Insert into MySQL
-    print("Inserting into 'certifications' table...")
-    try:
-        df_upload.to_sql('certifications', con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {len(df_upload)} certifications inserted.")
-    except Exception as e:
-        print(f"Insertion error: {e}")
+            records.append({
+                "id": str(uuid.uuid4()),
+                "project_id": project_id,
+                "month": month,
+                "net_amount": round(import_amb_iva / 1.21, 2),
+                "amount": round(import_amb_iva, 2),
+                "certification_date": cert_date,
+            })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Funcions públiques
+# ---------------------------------------------------------------------------
+
+def migrate_certifications_AT(mysql_url, oracle_config=None, json_file="data/map_assistance_type.json"):
+    print("Starting AT Certifications migration...")
+
+    with open(json_file, encoding="utf-8") as f:
+        raw = json.load(f)
+    tasca_to_at = {}
+    for at_code, names in raw.items():
+        for name in names:
+            tasca_to_at[name.strip()] = at_code
+
+    engine = create_engine(mysql_url)
+    action_map, project_lookup, existing = _load_mysql_maps(engine)
+
+    print("  Extracting from Oracle...")
+    if oracle_config:
+        try:
+            records = _extract_at_oracle(oracle_config, action_map, project_lookup, tasca_to_at)
+            print(f"  Oracle source: {len(records)} rows")
+        except Exception as e:
+            print(f"  Oracle failed ({e}), falling back to CSV")
+            records = _extract_at_csv(action_map, project_lookup, tasca_to_at)
+            print(f"  CSV fallback: {len(records)} rows")
+    else:
+        records = _extract_at_csv(action_map, project_lookup, tasca_to_at)
+        print(f"  CSV fallback: {len(records)} rows")
+
+    inserted, skipped = _insert_certifications(engine, records, existing)
+    print(f"  AT Certifications: {inserted} inserted, {skipped} already existed.")
+
+
+def migrate_certifications_obra(mysql_url, oracle_config=None):
+    print("Starting Obra Certifications migration...")
+
+    engine = create_engine(mysql_url)
+    action_map, project_lookup, existing = _load_mysql_maps(engine)
+
+    print("  Extracting from Oracle...")
+    if oracle_config:
+        try:
+            records = _extract_obra_oracle(oracle_config, action_map, project_lookup)
+            print(f"  Oracle source: {len(records)} rows")
+        except Exception as e:
+            print(f"  Oracle failed ({e}), falling back to CSV")
+            records = _extract_obra_csv(action_map, project_lookup)
+            print(f"  CSV fallback: {len(records)} rows")
+    else:
+        records = _extract_obra_csv(action_map, project_lookup)
+        print(f"  CSV fallback: {len(records)} rows")
+
+    inserted, skipped = _insert_certifications(engine, records, existing)
+    print(f"  Obra Certifications: {inserted} inserted, {skipped} already existed.")

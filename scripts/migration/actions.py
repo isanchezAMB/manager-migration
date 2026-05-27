@@ -1,383 +1,325 @@
-from datetime import datetime
+import csv
+import json
 import uuid
-from sqlalchemy import create_engine, text
-import pandas as pd
+import unicodedata
 import oracledb
-from flask import json
+import pandas as pd
+from datetime import datetime
+from sqlalchemy import create_engine, text
 
 
-
-# Migrar actions:
-# La majoria d'info prové de PIO_ACTUACIONS (gestor antic)
+# Campos migrados:
 # tracking_code = CASEID
-# name = TITOL
-# alias = ALIES
-# description = DESCRIPCIOPROJECTE (és d'una altra taula PIO_PROJECTE)
-# owner_id, s'haura de fer a mà suposo
-# service_id = SERVEIPO (referència a IDSERVEI_PO de la taula PIO_SERVEI_PO) (Hauria de ser el id de la taula services corresponent)
-# action_type_id, fet a update_types (falta canviar el json)
-# action_subtype_id, fet a update_types (falta canviar el json)
-# geometry, json de shapes
-# geometry_type, si està dibuixat o upload
-# geometry_source, si està dibuixat o upload (en català)
-# address = ADRECA
+# name         = TITOL
+# alias        = ALIES
+# description  = DESCRIPCIOPROJECTE (de PIO_PROJECTE)
+# service_id   = SERVEIPO -> PIO_SERVEI_PO.CODI -> services.key
+# action_type_id / action_subtype_id -> via update_types()
+# address      = ADRECA
 
-# NO TENIM INFO
-# assistance_type_id
-# priority_id (referencia a taula priorities)
-# requested_at
-# request_channel_id (referencia a taula request_channels)
-# phase_0_finished_at
-# phase_1_finished_at
-# phase_2_finished_at
-# phase_3_finished_at
-# final_finished_at
+# Campos sin datos suficientes (se dejan NULL):
+# owner_id, assistance_type_id, priority_id, request_channel_id
+# status, started_at, ended_at, holded_at, phase_*_finished_at
+# activity_type_id, subsidy_*, accounting_project_code
+# area, comments, objectives_description, target_date_*
 
 
-# NO SABEM QUE ÉS
-# activity_type_id
-# status
-# subsidy_pending
-# subsidy_notes
-# accounting_project_code (sembla que es expedient de proj)
-# started_at
-# ended_at
-# holded_at
-# programme_membership_data
-# target_date_p0
-# target_date_p1
-# target_date_p2
-# objectives_description
-# area (suposo que és l'area en m2, però no ho sé segur)
-# comments
+def _normalize_city(name):
+    """Normaliza nombre de municipio al formato key de la tabla cities."""
+    s = str(name).lower().strip()
+    s = unicodedata.normalize("NFKD", s).encode("ascii", errors="ignore").decode("utf-8")
+    s = s.replace("'", "")
+    s = " ".join(s.split()).replace(" ", "-")
+    if s == "hospitalet-de-llobregat":
+        s = "lhospitalet-de-llobregat"
+    return s
 
 
+# ---------------------------------------------------------------------------
+# Extracción
+# ---------------------------------------------------------------------------
 
-# NO MIGRAR, NO CRITIC, ES FARAN AL GESTOR MANUALMENT SOTA DEMANDA
-# phase_0_questionary
-# phase_1_questionary
-# phase_2_questionary
-# phase_3_questionary
-# final_questionary
-# phase_0_feedback
-# feedback_token
-# feedback_emails
-# has_.... (molt camps de booleanos que no tenim info)
-# uploaded_documents
+def _extract_actions_oracle(oracle_config, valid_cases):
+    with oracledb.connect(**oracle_config) as conn:
+        query = """
+            SELECT
+                a.CASEID, a.TITOL, a.ALIES, a.ADRECA,
+                a.ETIQUETAMUNICIPIS,
+                p.DESCRIPCIOPROJECTE,
+                COALESCE(sObra.CODI, sPo.CODI) AS SERVICE_KEY,
+                t.TIPUSACTUACIO AS OLD_TYPE,
+                sub.SUBTIPUSACTUACIO AS OLD_SUBTYPE
+            FROM PIO_ACTUACIONS a
+            LEFT JOIN PIO_PROJECTE p ON a.PROJECTE = p.IDPROJECTE
+            LEFT JOIN PIO_SERVEI_PO sObra ON a.SERVEIPOOBRA = sObra.IDSERVEI_PO
+            LEFT JOIN PIO_SERVEI_PO sPo   ON a.SERVEIPO     = sPo.IDSERVEI_PO
+            LEFT JOIN PIO_SUBTIPUSDACTUACIO sub ON p.SUBTIPUSACTUACIO = sub.IDSUBTIPUSDACTUACIO
+            LEFT JOIN PIO_TIPUSDACTUACIO t ON sub.IDTIPUSDACTUACIO = t.IDTIPUSDACTUACIO
+        """
+        df = pd.read_sql(query, conn)
+        for col in df.columns:
+            if df[col].dtype == "object":
+                df[col] = df[col].apply(lambda x: x.read() if hasattr(x, "read") else x)
+    df["CASEID_STR"] = df["CASEID"].astype(str).str.strip()
+    return df[df["CASEID_STR"].isin(valid_cases)]
 
 
+def _extract_actions_csv(valid_cases):
+    # PIO_ACTUACIONS
+    act = {}
+    with open("data/oracle_export/PIO_ACTUACIONS.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            caseid = str(row.get("CASEID", "")).strip()
+            if caseid in valid_cases:
+                act[caseid] = row
+
+    # PIO_PROJECTE indexado por IDPROJECTE
+    proj = {}
+    with open("data/oracle_export/PIO_PROJECTE.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            proj[str(row.get("IDPROJECTE", "")).strip()] = row
+
+    # PIO_SERVEI_PO indexado por IDSERVEI_PO
+    serv = {}
+    with open("data/oracle_export/PIO_SERVEI_PO.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            serv[str(row.get("IDSERVEI_PO", "")).strip()] = row
+
+    # PIO_SUBTIPUSDACTUACIO
+    subtipus = {}
+    with open("data/oracle_export/PIO_SUBTIPUSDACTUACIO.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            subtipus[str(row.get("IDSUBTIPUSDACTUACIO", "")).strip()] = row
+
+    # PIO_TIPUSDACTUACIO
+    tipusd = {}
+    with open("data/oracle_export/PIO_TIPUSDACTUACIO.csv", encoding="utf-8-sig", errors="replace") as f:
+        for row in csv.DictReader(f):
+            tipusd[str(row.get("IDTIPUSDACTUACIO", "")).strip()] = row
+
+    rows = []
+    for caseid, a in act.items():
+        p = proj.get(str(a.get("PROJECTE", "")).split(".")[0].strip(), {})
+        sub_id = str(p.get("SUBTIPUSACTUACIO", "")).split(".")[0].strip()
+        sub = subtipus.get(sub_id, {})
+        tip = tipusd.get(str(sub.get("IDTIPUSDACTUACIO", "")).strip(), {})
+
+        # SERVEIPOOBRA es prioritario, SERVEIPO como fallback
+        obra_id = str(a.get("SERVEIPOOBRA", "")).split(".")[0].strip()
+        po_id   = str(a.get("SERVEIPO", "")).split(".")[0].strip()
+        s = serv.get(obra_id or po_id, {})
+
+        rows.append({
+            "CASEID": caseid,
+            "CASEID_STR": caseid,
+            "TITOL": a.get("TITOL", ""),
+            "ALIES": a.get("ALIES", ""),
+            "ADRECA": a.get("ADRECA", ""),
+            "ETIQUETAMUNICIPIS": a.get("ETIQUETAMUNICIPIS", ""),
+            "DESCRIPCIOPROJECTE": p.get("DESCRIPCIOPROJECTE", ""),
+            "SERVICE_KEY": s.get("CODI", ""),
+            "OLD_TYPE": tip.get("TIPUSACTUACIO", ""),
+            "OLD_SUBTYPE": sub.get("SUBTIPUSACTUACIO", ""),
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
+# migrate_actions
+# ---------------------------------------------------------------------------
 
 def migrate_actions(mysql_url, oracle_config, valid_cases):
-    mysql_engine = create_engine(mysql_url)
-    # Fetch UUID mapping from MySQL
-    print("Fetching service UUIDs from MySQL...")
-    try:
-        services_df = pd.read_sql("SELECT id, `key` FROM services", mysql_engine)
-        services_df['key'] = services_df['key'].astype(str).str.strip()
-        service_map = dict(zip(services_df['key'], services_df['id']))
-    except Exception as e:
-        print(f"Error loading services: {e}")
-        return
+    print("Starting Actions migration...")
 
-    # Extract Data from Oracle
-    print("Connecting to Oracle...")
-    df_raw = pd.DataFrame()
-    try:
-        with oracledb.connect(user=oracle_config["user"], 
-                              password=oracle_config["password"], 
-                              dsn=oracle_config["dsn"]) as ora_conn:
-            
-            query = """
-                    SELECT 
-                        a.CASEID, a.TITOL, a.ALIES, a.ADRECA,
-                        p.DESCRIPCIOPROJECTE,
-                        s.CODI as SERVICE_KEY
-                    FROM PIO_ACTUACIONS a
-                    LEFT JOIN PIO_PROJECTE p ON a.PROJECTE = p.IDPROJECTE
-                    LEFT JOIN PIO_SERVEI_PO s ON a.SERVEIPO = s.IDSERVEI_PO
-                """
-            df_raw = pd.read_sql(query, ora_conn)
+    engine = create_engine(mysql_url)
 
-            # Convert Oracle LOBs to Strings
-            for col in df_raw.columns:
-                if df_raw[col].dtype == 'object':
-                    df_raw[col] = df_raw[col].apply(lambda x: x.read() if hasattr(x, 'read') else x)
+    # Cargar mapas de MySQL
+    with engine.connect() as conn:
+        services_df = pd.read_sql("SELECT id, `key` FROM services", conn)
+        service_map = dict(zip(services_df["key"].str.strip(), services_df["id"]))
 
-        print(f"Extracted {len(df_raw)} rows from Oracle (Raw).")
-        
-    except Exception as e:
-        print(f"Oracle Extraction Error: {e}")
-        return
+        at_df = pd.read_sql("SELECT id, `key` FROM action_types", conn)
+        type_map = dict(zip(at_df["key"], at_df["id"]))
 
-    # Filter by valid_cases (JSON)
-    if not df_raw.empty:
-        initial_count = len(df_raw)
-        
-        # Normalize CASEID for ensure matching with valid_cases (strip spaces, convert to string)
-        df_raw['CASEID_STR'] = df_raw['CASEID'].astype(str).str.strip()
-        
-        # Filter only the rows where CASEID_STR is in valid_cases
-        df_raw = df_raw[df_raw['CASEID_STR'].isin(valid_cases)]
-        
-        final_count = len(df_raw)
-        print(f"   Initial cases: {initial_count}")
-        print(f"   Valid cases: {final_count}")
-        print(f"   Discards: {initial_count - final_count}")
-        
-        if df_raw.empty:
-            print("No valid cases found after filtering with JSON. Migration will be skipped.")
-            return
-    else:
-        print("No data found in Oracle.")
-        return
+        existing_codes = {
+            str(r[0]) for r in conn.execute(text("SELECT tracking_code FROM actions WHERE tracking_code IS NOT NULL"))
+        }
 
-    # Transform data
-    
-    df_raw = df_raw.reset_index(drop=True)
-    
-    df = pd.DataFrame(index=df_raw.index)
-    df['id'] = [str(uuid.uuid4()) for _ in range(len(df_raw))]
-    
-    # Key cleaning
-    df_raw['SERVICE_KEY_CLEAN'] = (
-        df_raw['SERVICE_KEY']
-        .astype(str)
-        .str.strip()
-        .replace(['None', 'nan', 'NaN', 'NAT', 'None'], None)
-    )
+    # Cargar mapping JSON de tipos
+    with open("data/map_type_subtype.json", encoding="utf-8") as f:
+        mapping_json = json.load(f)
 
-    # Mapping service_id using the cleaned SERVICE_KEY
-    df['service_id'] = df_raw['SERVICE_KEY_CLEAN'].map(service_map)
-    
-    # Mapping other fields directly
-    df['tracking_code'] = df_raw['CASEID']
-    df['name'] = df_raw['TITOL']
-    df['alias'] = df_raw['ALIES']
-    df['description'] = df_raw['DESCRIPCIOPROJECTE']
-    df['address'] = df_raw['ADRECA']
-    df['created_at'] = datetime.now()
-    df['updated_at'] = datetime.now()
-
-    cols = ['id', 'tracking_code', 'name', 'alias', 'description', 
-            'service_id', 'address', 'created_at', 'updated_at']
-    df = df[cols]
-
-    # Load Data into MySQL
-    print("Loading into MySQL...")
-    try:
-        df.to_sql('actions', con=mysql_engine, if_exists='append', index=False)
-        print(f"Migration successful: {len(df)} actions inserted.")
-    except Exception as e:
-        print(f"MySQL Loading Error: {e}")
-
-
-
-# Migrar TipusActuacio:
-# Afegir id de tipus_actuacio i subtipus_actuacio a la taula actions
-# Tenim un json que relacion el tipus i subtipus antic amb el nou
-# A la taula PIO_ACTUACIONS tenim el camp SUBTIPUSACTUACIO que es un integer que fa referència a la taula PIO_SUBTIPUSACTUACIO
-# A la taula PIO_SUBTIPUSACTUACIO tenim el camp IDTIPUSDACTUACIO que fa referència a la taula PIO_TIPUSDACTUACIO
-# A la taula PIO_TIPUSACTUACIO tenim el camp TIPUS_ACTUACIO que es el nom del tipus d'actuacio
-# A la taula PIO_SUBTIPUSACTUACIO tenim el camp SUBTIPUS_ACTUACIO que es el nom del subtipus d'actuacio
-# El json relaciona el nom del tipus i subtipus nou amb el nom del tipus i subtipus antic, per tant haurem de fer un mapping a través d'aquests noms
-def update_types(json_file, mysql_url, oracle_config):
-    mysql_engine = create_engine(mysql_url)
-    
-    with open(json_file, "r", encoding="utf-8") as f:
-        MAPPING_JSON = json.load(f)
-
-    # Plain mapping dictionaries
     old_to_new_type = {}
     old_to_new_subtype = {}
-
-    for type_key, content in MAPPING_JSON.items():
-        # Type
+    for type_key, content in mapping_json.items():
         for old_name in content.get("tipus", []):
-            old_to_new_type[old_name] = type_key
-        # Subtype
+            old_to_new_type[old_name.strip()] = type_key
         for subtype_key, old_list in content.get("subtipus", {}).items():
             for old_name in old_list:
-                old_to_new_subtype[old_name] = subtype_key
+                old_to_new_subtype[old_name.strip()] = subtype_key
 
-    # Obtain UUID mapping for action types from MySQL
-    try:
-        at_df = pd.read_sql("SELECT id, `key` FROM action_types", mysql_engine)
-        
-        key_to_uuid = dict(zip(at_df['key'], at_df['id']))
-    except Exception as e:
-        print(f"Error reading action_types from MySQL: {e}")
-        return
-
+    # Extracción
     df = pd.DataFrame()
-    try:
-        with oracledb.connect(user=oracle_config["user"], 
-                             password=oracle_config["password"], 
-                             dsn=oracle_config["dsn"]) as ora_conn:
-            
-            query = """
-                SELECT 
-                    a.CASEID, 
-                    t.TIPUSACTUACIO AS OLD_TYPE,
-                    s.SUBTIPUSACTUACIO AS OLD_SUBTYPE
-                FROM PIO_ACTUACIONS a
-                LEFT JOIN PIO_PROJECTE p ON a.PROJECTE = p.IDPROJECTE
-                LEFT JOIN PIO_SUBTIPUSDACTUACIO s ON p.SUBTIPUSACTUACIO = s.IDSUBTIPUSDACTUACIO
-                LEFT JOIN PIO_TIPUSDACTUACIO t ON s.IDTIPUSDACTUACIO = t.IDTIPUSDACTUACIO
-            """
-            df = pd.read_sql(query, ora_conn)
-            
-        print(f"{len(df)} rows extracted from Oracle for type mapping.")
-    except Exception as e:
-        print(f"Error extracting from Oracle: {e}")
+    if oracle_config:
+        try:
+            df = _extract_actions_oracle(oracle_config, valid_cases)
+            print(f"  Source: Oracle — {len(df)} rows")
+        except Exception as e:
+            print(f"  Oracle failed ({e}), falling back to CSV")
+
+    if df.empty:
+        df = _extract_actions_csv(valid_cases)
+        print(f"  Source: CSV — {len(df)} rows")
+
+    if df.empty:
+        print("No actions found.")
         return
 
-  
-    if not df.empty:
-        df['tracking_code'] = pd.to_numeric(df['CASEID'], errors='coerce').fillna(0).astype(int).astype(str)
-        
-        # Map OLD_TYPE to new type keys, then to UUIDs
-        df['type_uuid'] = df['OLD_TYPE'].map(old_to_new_type).map(key_to_uuid)
-        
-        # Map OLD_SUBTYPE to new subtype keys, then to UUIDs
-        df['subtype_uuid'] = df['OLD_SUBTYPE'].map(old_to_new_subtype).map(key_to_uuid)
+    # Transformación
+    now = datetime.now()
+    to_insert = []
+    to_update = []
 
-        # Filter only rows where tracking_code is not null (valid cases)
-        update_df = df[['tracking_code', 'type_uuid', 'subtype_uuid']].dropna(subset=['tracking_code'])
-        
-        print(f"Row ready to update: {len(update_df)}")
-        print(f"   - Types found: {update_df['type_uuid'].notnull().sum()}")
-        print(f"   - Subtypes found: {update_df['subtype_uuid'].notnull().sum()}")
-        
-    else:
-        print("No data found in Oracle for type mapping.")
-        return
+    for _, row in df.iterrows():
+        code = str(row["CASEID_STR"]).strip()
 
+        svc_key = str(row.get("SERVICE_KEY") or "").strip()
+        service_id = service_map.get(svc_key)
 
-    try:
-        with mysql_engine.begin() as conn:
-            # Temporary table
+        old_type = str(row.get("OLD_TYPE") or "").strip()
+        old_subtype = str(row.get("OLD_SUBTYPE") or "").strip()
+        new_type_key = old_to_new_type.get(old_type)
+        new_subtype_key = old_to_new_subtype.get(old_subtype)
+        action_type_id = type_map.get(new_type_key) if new_type_key else None
+        action_subtype_id = type_map.get(new_subtype_key) if new_subtype_key else None
+
+        desc = str(row.get("DESCRIPCIOPROJECTE") or "").strip() or None
+        if desc and len(desc) > 500:
+            desc = desc[:500]
+
+        record = {
+            "tracking_code": int(float(code)),
+            "name": str(row.get("TITOL") or "").strip(),
+            "alias": str(row.get("ALIES") or "").strip() or None,
+            "description": desc,
+            "address": str(row.get("ADRECA") or "").strip() or None,
+            "service_id": service_id,
+            "action_type_id": action_type_id,
+            "action_subtype_id": action_subtype_id,
+            "updated_at": now,
+        }
+
+        if code in existing_codes:
+            to_update.append(record)
+        else:
+            to_insert.append({**record, "id": str(uuid.uuid4()), "created_at": now})
+
+    # Carga
+    inserted = updated = 0
+    with engine.connect() as conn:
+        for r in to_insert:
             conn.execute(text("""
-                CREATE TEMPORARY TABLE temp_update_types (
-                    tracking_code VARCHAR(255),
-                    type_uuid CHAR(36),
-                    subtype_uuid CHAR(36),
-                    INDEX(tracking_code)
-                );
-            """))
-            
-            # Load data into temporary table
-            update_df.to_sql('temp_update_types', con=conn, if_exists='append', index=False)
-            
-            # Update actions using JOIN with temporary table
-            result = conn.execute(text("""
-                UPDATE actions a
-                INNER JOIN temp_update_types t ON a.tracking_code = t.tracking_code
-                SET 
-                    a.action_type_id = t.type_uuid,
-                    a.action_subtype_id = t.subtype_uuid;
-            """))
-            
-            # Drop temporary table
-            conn.execute(text("DROP TEMPORARY TABLE IF EXISTS temp_update_types;"))
-            
-            print(f"Done, rows updated: {result.rowcount}")
-            
-    except Exception as e:
-        print(f"Error updating MySQL: {e}")
+                INSERT INTO actions
+                    (id, tracking_code, name, alias, description, address,
+                     service_id, action_type_id, action_subtype_id, created_at, updated_at)
+                VALUES
+                    (:id, :tracking_code, :name, :alias, :description, :address,
+                     :service_id, :action_type_id, :action_subtype_id, :created_at, :updated_at)
+            """), r)
+            inserted += 1
+
+        for r in to_update:
+            conn.execute(text("""
+                UPDATE actions SET
+                    name = :name, alias = :alias, description = :description,
+                    address = :address, service_id = :service_id,
+                    action_type_id = :action_type_id, action_subtype_id = :action_subtype_id,
+                    updated_at = :updated_at
+                WHERE tracking_code = :tracking_code
+            """), r)
+            updated += 1
+
+        conn.commit()
+
+    without_type = sum(1 for r in to_insert + to_update if r["action_type_id"] is None)
+    without_service = sum(1 for r in to_insert + to_update if r["service_id"] is None)
+    print(f"Migration successful: {inserted} inserted, {updated} updated.")
+    print(f"  Without type: {without_type} | Without service: {without_service}")
 
 
+# ---------------------------------------------------------------------------
+# migrate_action_city
+# ---------------------------------------------------------------------------
 
-# migrar action_city:
-# La informació prové de la taula PIO_ACTUACIONS
-# action_id = cercar a la taula actions el id que tingui el mateix tracking_code que el CASEID de PIO_ACTUACIONS
-# city_id = cercar a la taula cities el id que tingui el mateix key que el camp ETIQUETAMUNICIPIS de PIO_ACTUACIONS
-# el camp ETIQUETAMUNICIPIS s'ha de normalitzar a minúscules i eliminar qualsevol caràcter com apòstrof, i els espais convertirlos en guions, per exemple "Sant Cugat del Vallès" -> "sant-cugat-del-valles", així s'assegura que coincideixi amb el camp key de la taula cities que ja està net.
-
-def migrate_action_city(mysql_url, oracle_config):
+def migrate_action_city(mysql_url, oracle_config=None):
     print("Starting Action <-> City migration...")
-    
-    mysql_engine = create_engine(mysql_url)
 
-    # LOAD MYSQL CONTEXT
-    print("Loading MySQL maps (Actions and Cities)...")
-    try:
-        actions_df = pd.read_sql("SELECT id, tracking_code FROM actions", mysql_engine)
-        actions_df['clean_code'] = (
-            pd.to_numeric(actions_df['tracking_code'], errors='coerce')
-            .fillna(0).astype(int).astype(str)
-        )
-        action_map = dict(zip(actions_df['clean_code'], actions_df['id']))
+    engine = create_engine(mysql_url)
 
-        cities_df = pd.read_sql("SELECT id, `key` FROM cities", mysql_engine)
-        cities_df['key_clean'] = cities_df['key'].astype(str).str.strip().str.lower()
-        city_map = dict(zip(cities_df['key_clean'], cities_df['id']))
+    with engine.connect() as conn:
+        action_map = {
+            str(int(float(r[0]))): r[1]
+            for r in conn.execute(text("SELECT tracking_code, id FROM actions WHERE tracking_code IS NOT NULL"))
+        }
+        city_map = {
+            r[0].strip().lower(): r[1]
+            for r in conn.execute(text("SELECT `key`, id FROM cities"))
+        }
+        existing_pairs = {
+            (r[0], r[1])
+            for r in conn.execute(text("SELECT action_id, city_id FROM action_city"))
+        }
 
-    except Exception as e:
-        print(f"Error loading MySQL dependencies: {e}")
-        return
+    # Extracción
+    rows = []
+    if oracle_config:
+        try:
+            with oracledb.connect(**oracle_config) as ora_conn:
+                df = pd.read_sql(
+                    "SELECT CASEID, ETIQUETAMUNICIPIS FROM PIO_ACTUACIONS WHERE ETIQUETAMUNICIPIS IS NOT NULL",
+                    ora_conn
+                )
+            for _, row in df.iterrows():
+                rows.append((str(row["CASEID"]).strip(), str(row["ETIQUETAMUNICIPIS"])))
+            print(f"  Source: Oracle — {len(rows)} rows")
+        except Exception as e:
+            print(f"  Oracle failed ({e}), falling back to CSV")
 
-    # READ ORACLE DATA
-    print("Reading PIO_ACTUACIONS from Oracle...")
-    try:
-        with oracledb.connect(**oracle_config) as ora_conn:
-            query = "SELECT CASEID, ETIQUETAMUNICIPIS FROM PIO_ACTUACIONS WHERE ETIQUETAMUNICIPIS IS NOT NULL"
-            df_act = pd.read_sql(query, ora_conn)
-            print(f"Read {len(df_act)} base relations from Oracle.")
-    except Exception as e:
-        print(f"Fatal error connecting to Oracle: {e}")
-        return
+    if not rows:
+        with open("data/oracle_export/PIO_ACTUACIONS.csv", encoding="utf-8-sig", errors="replace") as f:
+            for row in csv.DictReader(f):
+                mun = row.get("ETIQUETAMUNICIPIS", "").strip()
+                if mun:
+                    rows.append((str(row.get("CASEID", "")).strip(), mun))
+        print(f"  Source: CSV — {len(rows)} rows")
 
-    if df_act.empty: 
-        return
+    # Transformación y carga
+    now = datetime.now()
+    inserted = skipped = 0
+    with engine.connect() as conn:
+        for caseid, mun_raw in rows:
+            action_id = action_map.get(caseid)
+            if not action_id:
+                continue
 
-    # SEPARATE MULTIPLE MUNICIPALITIES AND NORMALIZE
-    print("Normalizing and mapping municipalities...")
+            for mun in mun_raw.split(","):
+                city_key = _normalize_city(mun)
+                city_id = city_map.get(city_key)
+                if not city_id:
+                    continue
 
-    df_act['case_clean'] = pd.to_numeric(df_act['CASEID'], errors='coerce').fillna(0).astype(int).astype(str)
+                pair = (action_id, city_id)
+                if pair in existing_pairs:
+                    skipped += 1
+                    continue
 
-    # Separate by commas and explode into independent rows
-    df_act['MUNICIPI_LLISTA'] = df_act['ETIQUETAMUNICIPIS'].astype(str).str.split(r',\s*')
-    df_act = df_act.explode('MUNICIPI_LLISTA')
+                conn.execute(text("""
+                    INSERT INTO action_city (action_id, city_id, created_at, updated_at)
+                    VALUES (:action_id, :city_id, :created_at, :updated_at)
+                """), {"action_id": action_id, "city_id": city_id, "created_at": now, "updated_at": now})
+                existing_pairs.add(pair)
+                inserted += 1
 
-    # Normalize municipality strings
-    df_act['mun_norm'] = df_act['MUNICIPI_LLISTA'].astype(str).str.lower().str.strip()
-    
-    df_act['mun_norm'] = (
-        df_act['mun_norm']
-        .str.normalize('NFKD')
-        .str.encode('ascii', errors='ignore')
-        .str.decode('utf-8')
-    )
-    
-    df_act['mun_norm'] = df_act['mun_norm'].str.replace("'", "", regex=False)
-    df_act['mun_norm'] = df_act['mun_norm'].str.replace(r'\s+', '-', regex=True)
-    df_act['mun_norm'] = df_act['mun_norm'].replace({
-        'hospitalet-de-llobregat': 'lhospitalet-de-llobregat',
-    })
+        conn.commit()
 
-    # Map to MySQL IDs
-    df_act['action_id'] = df_act['case_clean'].map(action_map)
-    df_act['city_id'] = df_act['mun_norm'].map(city_map)
-
-    # Filter out missing records and drop duplicates
-    df_final = df_act.dropna(subset=['action_id', 'city_id']).copy()
-    df_final = df_final.drop_duplicates(subset=['action_id', 'city_id'])
-    
-    total_final = len(df_final)
-
-    if df_final.empty: 
-        print("No valid relations found to insert.")
-        return
-
-    # PREPARE AND INSERT
-    df_final['created_at'] = datetime.now()
-    df_final['updated_at'] = datetime.now()
-
-    cols_to_insert = ['action_id', 'city_id', 'created_at', 'updated_at']
-
-    print("Inserting into 'action_city' (MySQL)...")
-    try:
-        df_final[cols_to_insert].to_sql('action_city', con=mysql_engine, if_exists='append', index=False)
-        print(f"Success! {total_final} relations inserted correctly.")
-    except Exception as e:
-        print(f"Error inserting into MySQL: {e}")
+    print(f"Migration successful: {inserted} inserted, {skipped} already existed.")
