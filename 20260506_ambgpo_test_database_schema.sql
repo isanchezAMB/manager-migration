@@ -4,8 +4,8 @@
  Source Server         : IDEAS PROD
  Source Server Type    : MySQL
  Source Server Version : 80044 (8.0.44)
- Source Host           : ideas-db-production.cchhpooiguka.eu-west-3.rds.amazonaws.com:3306
- Source Schema         : ambgpo_test
+ Source Host           : <redacted>
+ Source Schema         : <redacted>
 
  Target Server Type    : MySQL
  Target Server Version : 80044 (8.0.44)
